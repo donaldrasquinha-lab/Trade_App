@@ -1050,19 +1050,38 @@ pe_snr = {"support": [], "resistance": [], "current": pe_ltp or 0}
 
 def scale_snr_to_premium(idx_support, idx_resistance, idx_current,
                           option_ltp, delta):
-    """Scale index S/R levels to option premium levels via delta."""
-    if not option_ltp or option_ltp <= 0:
+    """
+    Scale index S/R levels to option premium levels via delta.
+    delta: fractional (e.g. 0.5), not percentage.
+    Keeps levels within 30% of option_ltp on each side.
+    """
+    if not option_ltp or option_ltp <= 0 or not delta:
         return [], []
+
+    min_gap = max(option_ltp * 0.01, 0.5)   # at least 1% or 0.5 pts apart
     supports, resistances = [], []
+
     for p in idx_support:
         opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
-        if 0 < opt_lvl < option_ltp:
+        # Support: below ltp, positive, within 30% down
+        if 0 < opt_lvl < (option_ltp - min_gap) and opt_lvl > option_ltp * 0.70:
             supports.append(opt_lvl)
+
     for p in idx_resistance:
         opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
-        if opt_lvl > option_ltp:
+        # Resistance: above ltp, within 30% up
+        if opt_lvl > (option_ltp + min_gap) and opt_lvl < option_ltp * 1.30:
             resistances.append(opt_lvl)
-    return sorted(supports)[-3:], sorted(resistances)[:3]
+
+    # Deduplicate levels too close together (within 0.5%)
+    def dedup(lst):
+        result = []
+        for v in sorted(lst):
+            if not result or (v - result[-1]) / result[-1] > 0.005:
+                result.append(v)
+        return result
+
+    return dedup(supports)[-3:], dedup(resistances)[:3]
 
 ce_delta_val = abs(g_ce["delta"]) if g_ce and g_ce.get("delta") else 0.5
 pe_delta_val = abs(g_pe["delta"]) if g_pe and g_pe.get("delta") else 0.5
@@ -1455,9 +1474,6 @@ def render_snr_bar(snr, ltp, label_col, bg_col):
     """Render a compact S/R level bar for an option premium."""
     supports    = snr.get("support", [])
     resistances = snr.get("resistance", [])
-    if not supports and not resistances:
-        st.caption("S/R: computing...")
-        return
 
     def level_pill(price, kind):
         color = "#00c853" if kind == "S" else "#f44336"
@@ -1471,6 +1487,12 @@ def render_snr_bar(snr, ltp, label_col, bg_col):
             f'{kind} {price:.1f} <span style="opacity:0.7;font-size:10px;">({sign}{dist:.1f})</span>'
             f'</span>'
         )
+
+    # Fallback: if scaling produced nothing, synthesise ±5/10/15% levels
+    if not supports:
+        supports = [round(ltp * f, 1) for f in [0.97, 0.94, 0.91]]
+    if not resistances:
+        resistances = [round(ltp * f, 1) for f in [1.03, 1.06, 1.09]]
 
     pills = ""
     for p in sorted(supports, reverse=True)[:3]:

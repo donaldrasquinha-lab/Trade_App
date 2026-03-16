@@ -87,7 +87,11 @@ defaults = {
     "last_chain":  {},
     "chain_ts":    None,
     "candle_ts":   None,
-    "candle_df":   None,   # pd.DataFrame of 1m candles
+    "candle_df":   None,   # primary timeframe candles
+    "candle_df_15": None,  # 15m candles
+    "candle_ts_15": None,
+    "candle_df_30": None,  # 30m candles
+    "candle_ts_30": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -480,8 +484,9 @@ with st.sidebar:
     strike_mode   = st.selectbox("Strike Selection", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     strike_offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
 
-    candle_interval = st.selectbox("Candle Interval", ["1", "3", "5"], index=0,
-                                    format_func=lambda x: f"{x} min")
+    candle_interval = st.selectbox("Primary Interval", ["1", "3", "5", "15", "30"], index=0,
+                                    format_func=lambda x: f"{x} min",
+                                    help="Used for signal. 15m & 30m always shown for confluence.")
 
     st.divider()
     st.markdown("### Greeks Parameters")
@@ -533,13 +538,19 @@ change_pct = feed_entry["change_pct"] if feed_entry else None
 data_age   = (datetime.now() - feed_entry["ts"]).total_seconds() if feed_entry else None
 
 # ==============================================================
-# 15. FETCH CANDLES  (every 60s)
+# 15. FETCH CANDLES  (primary + 15m + 30m)
+#     Primary: every 60s
+#     15m / 30m: every 5 min (candles change less frequently)
 # ==============================================================
 candle_df  = st.session_state.candle_df
 indicators = {}
 candle_err = None
 
+ind_15 = {}   # indicators from 15m chart
+ind_30 = {}   # indicators from 30m chart
+
 if run_live and spot:
+    # -- Primary timeframe --
     candle_age = (
         (datetime.now() - st.session_state.candle_ts).total_seconds()
         if st.session_state.candle_ts else 999
@@ -550,9 +561,34 @@ if run_live and spot:
             st.session_state.candle_df = new_df
             st.session_state.candle_ts = datetime.now()
             candle_df = new_df
-
     if candle_df is not None:
         candle_df, indicators = compute_indicators(candle_df)
+
+    # -- 15 minute timeframe --
+    age_15 = (
+        (datetime.now() - st.session_state.candle_ts_15).total_seconds()
+        if st.session_state.candle_ts_15 else 999
+    )
+    if age_15 >= 300:
+        df15, _ = fetch_candles(TOKEN, conf["instrument_key"], 15)
+        if df15 is not None and len(df15) >= 5:
+            st.session_state.candle_df_15 = df15
+            st.session_state.candle_ts_15 = datetime.now()
+    if st.session_state.candle_df_15 is not None:
+        _, ind_15 = compute_indicators(st.session_state.candle_df_15)
+
+    # -- 30 minute timeframe --
+    age_30 = (
+        (datetime.now() - st.session_state.candle_ts_30).total_seconds()
+        if st.session_state.candle_ts_30 else 999
+    )
+    if age_30 >= 300:
+        df30, _ = fetch_candles(TOKEN, conf["instrument_key"], 30)
+        if df30 is not None and len(df30) >= 5:
+            st.session_state.candle_df_30 = df30
+            st.session_state.candle_ts_30 = datetime.now()
+    if st.session_state.candle_df_30 is not None:
+        _, ind_30 = compute_indicators(st.session_state.candle_df_30)
 
 # ==============================================================
 # 16. FETCH OPTION CHAIN  (every 5s)
@@ -846,27 +882,75 @@ if spot and atm:
     st.divider()
 
 # ==============================================================
-# 21. INDICATOR SUMMARY BAR
+# 21. MULTI-TIMEFRAME INDICATOR PANEL
 # ==============================================================
-if indicators:
-    st.markdown("### Technical Indicators")
-    i1, i2, i3, i4, i5 = st.columns(5)
-    close = indicators["close"]
-    ema9  = indicators["ema9"]
-    ema21 = indicators["ema21"]
-    vwap  = indicators["vwap"]
-    rsi   = indicators["rsi"]
+def _ind_row(label, ind, tf, candles_n=None):
+    """Render one timeframe indicator row."""
+    if not ind:
+        st.caption(f"{tf} — waiting for data")
+        return
+    close = ind["close"]
+    ema9  = ind["ema9"]
+    ema21 = ind["ema21"]
+    vwap  = ind["vwap"]
+    rsi   = ind["rsi"]
 
-    i1.metric("EMA 9",  f"{ema9:,.2f}",
-              "▲ above price" if ema9 > close else "▼ below price")
-    i2.metric("EMA 21", f"{ema21:,.2f}",
-              "Bullish" if ema9 > ema21 else "Bearish")
-    i3.metric("VWAP",   f"{vwap:,.2f}",
-              "Price above" if close > vwap else "Price below")
-    i4.metric("RSI 14", f"{rsi}",
-              "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral")
-    i5.metric("Candle interval", f"{candle_interval}m",
-              f"{len(candle_df)} candles" if candle_df is not None else "--")
+    trend   = "🟢 Bull" if ema9 > ema21 else "🔴 Bear"
+    vs_vwap = "↑ above" if close > vwap else "↓ below"
+    rsi_lbl = "OB" if rsi > 70 else ("OS" if rsi < 30 else "OK")
+
+    c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.5, 1.5, 1.5, 1.2, 1.2])
+    c1.markdown(f"**{tf}**")
+    c2.metric("EMA 9",  f"{ema9:,.1f}",  "▲" if ema9 > close else "▼")
+    c3.metric("EMA 21", f"{ema21:,.1f}", trend)
+    c4.metric("VWAP",   f"{vwap:,.1f}",  vs_vwap)
+    c5.metric("RSI",    f"{rsi}",        rsi_lbl)
+    if candles_n:
+        c6.metric("Candles", candles_n)
+
+if indicators or ind_15 or ind_30:
+    st.markdown("### Technical Indicators — Multi-Timeframe")
+
+    # Confluence score across timeframes
+    def _tf_score(ind):
+        if not ind: return 0
+        s = 0
+        if ind["ema9"] > ind["ema21"]: s += 1
+        if ind["close"] > ind["vwap"]: s += 1
+        if ind["close"] > ind["ema9"]: s += 1
+        if 50 < ind["rsi"] < 75:       s += 1
+        return s
+
+    s_primary = _tf_score(indicators)
+    s_15      = _tf_score(ind_15)
+    s_30      = _tf_score(ind_30)
+    total     = s_primary + s_15 + s_30
+    max_total = 12
+
+    conf_pct  = int(total / max_total * 100)
+    conf_bar  = "█" * int(conf_pct / 10) + "░" * (10 - int(conf_pct / 10))
+    conf_color = "#00c853" if conf_pct >= 70 else ("#ffc107" if conf_pct >= 40 else "#f44336")
+
+    st.markdown(
+        f'<div style="background:#1a1a2e;border-radius:8px;padding:12px 16px;margin-bottom:12px;">'
+        f'<span style="color:#aaa;font-size:12px;text-transform:uppercase;">MTF Confluence</span>&nbsp;&nbsp;'
+        f'<span style="font-family:monospace;color:{conf_color};font-size:15px;">{conf_bar}</span>&nbsp;&nbsp;'
+        f'<b style="color:{conf_color};">{conf_pct}%</b>'
+        f'&nbsp;&nbsp;<span style="color:#888;font-size:12px;">'
+        f'{candle_interval}m: {s_primary}/4 &nbsp;|&nbsp; 15m: {s_15}/4 &nbsp;|&nbsp; 30m: {s_30}/4'
+        f'</span></div>',
+        unsafe_allow_html=True
+    )
+
+    n_primary = len(candle_df) if candle_df is not None else None
+    n_15      = len(st.session_state.candle_df_15) if st.session_state.candle_df_15 is not None else None
+    n_30      = len(st.session_state.candle_df_30) if st.session_state.candle_df_30 is not None else None
+
+    _ind_row(f"{candle_interval}m (primary)", indicators, f"{candle_interval}m", n_primary)
+    st.markdown('<hr style="margin:4px 0;border-color:#333;">', unsafe_allow_html=True)
+    _ind_row("15m", ind_15, "15m", n_15)
+    st.markdown('<hr style="margin:4px 0;border-color:#333;">', unsafe_allow_html=True)
+    _ind_row("30m", ind_30, "30m", n_30)
     st.divider()
 
 # ==============================================================

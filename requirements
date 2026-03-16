@@ -1,0 +1,6 @@
+streamlit           # The web framework for the UI
+pandas              # Data manipulation and table handling
+numpy               # Numerical calculations for Greeks
+scipy               # Statistical functions for Black-Scholes (norm.cdf)
+nsepython           # (Optional) To fetch live NSE India data
+requests            # For general API calls to brokers

@@ -1,7 +1,7 @@
 """
 Multi-Index Live Scalper Dashboard
-Upstox MarketDataStreamer (SDK built-in) -- no proto compile needed
--------------------------------------------------------------------
+Upstox MarketDataStreamerV3 (SDK built-in) -- no proto compile needed
+---------------------------------------------------------------------
 SETUP:
   1. pip install -r requirements.txt
   2. Create .streamlit/secrets.toml:
@@ -69,14 +69,13 @@ ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 # ==============================================================
 # 4. MODULE-LEVEL SHARED STATE
 #
-#    Background threads MUST NOT touch st.session_state.
-#    All shared data lives here as plain Python objects.
-#    The main Streamlit thread reads these on every rerun.
+#    Uses single-element lists for mutable state so background
+#    threads can update values without needing `global` keyword
+#    and without touching st.session_state.
 # ==============================================================
-
-_price_feed = {}          # instrument_key -> {ltp, close, change_pct, ts}
-_ws_status  = ["disconnected"]   # single-element list so threads can write
-_ws_started = [False]            # single-element list, same reason
+_price_feed = {}         # instrument_key -> {ltp, close, change_pct, ts}
+_ws_status  = ["disconnected"]  # one of: connecting / live / error:<msg> / disconnected
+_ws_started = [False]
 
 # ==============================================================
 # 5. SESSION STATE INIT  (main thread only)
@@ -85,22 +84,39 @@ if "do_reconnect" not in st.session_state:
     st.session_state.do_reconnect = False
 
 # ==============================================================
-# 6. WEBSOCKET FEED
+# 6. WEBSOCKET FEED  -- MarketDataStreamerV3
+#
+#    Key facts from official SDK docs:
+#      - Constructor takes ApiClient only (no keys/mode in constructor)
+#      - streamer.subscribe(keys, mode) is called inside on_open()
+#      - Callbacks take NO arguments (not ws, message -- just message)
+#      - streamer.auto_reconnect(True, interval_sec, retries) is optional
 # ==============================================================
 
 def _stream_market_data(token, instrument_keys):
     """
-    Runs inside a daemon thread.
-    Uses upstox_client.MarketDataStreamer -- SDK handles proto decoding.
-    Only writes to module-level _price_feed and _ws_status.
-    NEVER accesses st.session_state.
+    Runs in a daemon thread.
+    Only writes to module-level _price_feed, _ws_status, _ws_started.
+    Never touches st.session_state.
     """
     _ws_status[0] = "connecting"
 
-    def on_open(ws):
+    configuration = upstox_client.Configuration()
+    configuration.access_token = token
+    api_client = upstox_client.ApiClient(configuration)
+
+    # Constructor takes ApiClient only -- keys/mode go in on_open
+    streamer = upstox_client.MarketDataStreamerV3(api_client)
+
+    # Auto-reconnect: enabled, 5 second interval, 3 retries
+    streamer.auto_reconnect(True, 5, 3)
+
+    def on_open():
+        # Subscribe must be called after connection is established
+        streamer.subscribe(instrument_keys, "ltpc")
         _ws_status[0] = "live"
 
-    def on_message(ws, message):
+    def on_message(message):
         try:
             for ikey, data in message.get("feeds", {}).items():
                 ltpc = data.get("ltpc", {})
@@ -119,25 +135,24 @@ def _stream_market_data(token, instrument_keys):
         except Exception:
             pass
 
-    def on_error(ws, error):
+    def on_error(error):
         _ws_status[0] = f"error:{error}"
 
-    def on_close(ws, *args):
+    def on_close():
         _ws_status[0] = "disconnected"
         _ws_started[0] = False
 
+    def on_reconnect_stopped(message):
+        _ws_status[0] = f"error:Auto-reconnect stopped -- {message}"
+        _ws_started[0] = False
+
+    streamer.on("open",                on_open)
+    streamer.on("message",             on_message)
+    streamer.on("error",               on_error)
+    streamer.on("close",               on_close)
+    streamer.on("autoReconnectStopped", on_reconnect_stopped)
+
     try:
-        streamer = upstox_client.MarketDataStreamer(
-            upstox_client.ApiClient(
-                upstox_client.Configuration(access_token=token)
-            ),
-            instrument_keys,
-            "ltpc",
-        )
-        streamer.on("open",    on_open)
-        streamer.on("message", on_message)
-        streamer.on("error",   on_error)
-        streamer.on("close",   on_close)
         streamer.connect()   # blocking
     except Exception as e:
         _ws_status[0] = f"error:{e}"
@@ -155,7 +170,6 @@ def start_feed():
         daemon=True,
         name="upstox-streamer",
     ).start()
-
 
 # ==============================================================
 # 7. GREEKS ENGINE
@@ -180,11 +194,11 @@ def greeks(S, K, T, r, sigma, option_type):
     gamma = pdf1 / (S * sigma * np.sqrt(T))
     vega  = S * pdf1 * np.sqrt(T) / 100
     return dict(
-        delta = round(delta,              4),
-        gamma = round(gamma,              6),
-        vega  = round(vega,               2),
-        theta = round(theta / 365,        2),
-        rho   = round(rho,                4),
+        delta = round(delta,         4),
+        gamma = round(gamma,         6),
+        vega  = round(vega,          2),
+        theta = round(theta / 365,   2),
+        rho   = round(rho,           4),
     )
 
 # ==============================================================
@@ -244,14 +258,14 @@ with st.sidebar:
     else:
         st.caption("WebSocket: Not started")
 
-    # Reconnect button -- sets a flag, handled at module level below
-    if status in ("disconnected", ) and _ws_started[0] is False:
+    # Reconnect button -- sets a session flag, handled below at module level
+    if not _ws_started[0] and status not in ("connecting",):
         if st.button("Reconnect"):
             st.session_state.do_reconnect = True
             st.rerun()
 
 # ==============================================================
-# 10. HANDLE RECONNECT FLAG  (module level -- safe for globals)
+# 10. HANDLE RECONNECT  (module level -- safe to write globals here)
 # ==============================================================
 if st.session_state.do_reconnect:
     _ws_started[0] = False
@@ -272,9 +286,9 @@ ikey       = conf["instrument_key"]
 feed_entry = _price_feed.get(ikey) if run_live else None
 
 if feed_entry:
-    spot        = feed_entry["ltp"]
-    change_pct  = feed_entry["change_pct"]
-    data_age    = (datetime.now() - feed_entry["ts"]).total_seconds()
+    spot       = feed_entry["ltp"]
+    change_pct = feed_entry["change_pct"]
+    data_age   = (datetime.now() - feed_entry["ts"]).total_seconds()
 else:
     spot = change_pct = data_age = None
 
@@ -319,9 +333,9 @@ m1.metric(
     f"Rs.{spot:,.2f}" if spot else "--",
     f"{change_pct:+.2f}%" if change_pct is not None else None,
 )
-m2.metric("ATM Strike",     f"{atm:,}"         if atm      else "--")
-m3.metric("Total Exposure", fmt_inr(exposure)  if exposure  else "--",
-          f"{lots} lot x {conf['lot_size']}"   if exposure  else None)
+m2.metric("ATM Strike",     f"{atm:,}"        if atm     else "--")
+m3.metric("Total Exposure", fmt_inr(exposure) if exposure else "--",
+          f"{lots} lot x {conf['lot_size']}"  if exposure else None)
 m4.metric("DTE", f"{dte_days}d", f"IV {iv_pct}%")
 
 st.divider()
@@ -385,10 +399,10 @@ if spot and atm:
             gp  = greeks(spot, pe_strike, rem, r, iv, "put")
             combined = round((gc["theta"] + gp["theta"]) * lots * conf["lot_size"], 2)
             rows.append({
-                "Day":              f"Day +{day}",
-                "DTE Remaining":    dte_days - day,
-                "CE Theta":         gc["theta"],
-                "PE Theta":         gp["theta"],
+                "Day":                   f"Day +{day}",
+                "DTE Remaining":         dte_days - day,
+                "CE Theta":              gc["theta"],
+                "PE Theta":              gp["theta"],
                 f"Net P&L Rs. x {lots}L": combined,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)

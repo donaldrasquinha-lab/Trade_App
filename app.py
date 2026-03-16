@@ -342,9 +342,16 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
                         og = getattr(opt, "option_greeks", None) or {}
                         if hasattr(md, "to_dict"): md = md.to_dict()
                         if hasattr(og, "to_dict"): og = og.to_dict()
+                    # OI field varies by API version: try all known names
+                    oi_val = int(
+                        md.get("oi", 0) or
+                        md.get("open_interest", 0) or
+                        md.get("total_buy_quantity", 0) or 0
+                    )
                     return {
                         "ltp":   float(md.get("ltp", 0) or 0),
-                        "oi":    int(md.get("oi",  0) or 0),
+                        "oi":    oi_val,
+                        "vol":   int(md.get("volume", 0) or 0),
                         "iv":    float(og.get("iv",    0) or 0),
                         "delta": float(og.get("delta", 0) or 0),
                         "theta": float(og.get("theta", 0) or 0),
@@ -362,6 +369,7 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
                     "ce_gamma":ce.get("gamma",0),"pe_gamma":pe.get("gamma",0),
                     "ce_vega": ce.get("vega", 0),"pe_vega": pe.get("vega",0),
                     "ce_oi":  ce.get("oi",   0), "pe_oi":  pe.get("oi",  0),
+                    "ce_vol": ce.get("vol",  0), "pe_vol": pe.get("vol", 0),
                 }
         return chain, None
     except Exception as e:
@@ -927,10 +935,18 @@ if run_live and spot and atm:
 # Compute PCR — use wide chain if available, fall back to display chain
 _pcr_chain = st.session_state.pcr_chain or st.session_state.last_chain
 if _pcr_chain and len(_pcr_chain) > 0:
-    _total_ce_oi = sum(v.get("ce_oi", 0) for v in _pcr_chain.values())
-    _total_pe_oi = sum(v.get("pe_oi", 0) for v in _pcr_chain.values())
+    # Try OI first, fall back to volume if OI is all zeros
+    _total_ce_oi  = sum(v.get("ce_oi",  0) for v in _pcr_chain.values())
+    _total_pe_oi  = sum(v.get("pe_oi",  0) for v in _pcr_chain.values())
+    _total_ce_vol = sum(v.get("ce_vol", 0) for v in _pcr_chain.values())
+    _total_pe_vol = sum(v.get("pe_vol", 0) for v in _pcr_chain.values())
+
     if _total_ce_oi > 0:
+        # OI-based PCR (preferred)
         st.session_state.pcr = round(_total_pe_oi / _total_ce_oi, 2)
+    elif _total_ce_vol > 0:
+        # Volume-based PCR (fallback when OI not available)
+        st.session_state.pcr = round(_total_pe_vol / _total_ce_vol, 2)
 
 ce_strike = atm - strike_offset * step if atm else None
 pe_strike = atm + strike_offset * step if atm else None
@@ -1239,13 +1255,31 @@ with h2:
         pcr_val = st.session_state.pcr
         vix_val = st.session_state.last_vix
         vix_str = f"VIX: {vix_val:.2f}%" if vix_val else "VIX: --"
-        if pcr_val:
-            if pcr_val > 1.2:   pcr_color, pcr_icon = "green",  "📈"
-            elif pcr_val < 0.8: pcr_color, pcr_icon = "red",    "📉"
-            else:               pcr_color, pcr_icon = "orange", "➡️"
-            pcr_str = f"{pcr_icon} PCR: **{pcr_val}**"
+        if pcr_val and pcr_val > 0:
+            if pcr_val > 1.2:   pcr_icon = "📈"
+            elif pcr_val < 0.8: pcr_icon = "📉"
+            else:               pcr_icon = "➡️"
+            pcr_str = f"{pcr_icon} PCR: {pcr_val}"
         else:
-            pcr_str = "PCR: fetching..."
+            # Show chain OI debug so we can diagnose
+            _dbg_chain = st.session_state.last_chain
+            if _dbg_chain:
+                _dbg_ce = sum(v.get("ce_oi",0) for v in _dbg_chain.values())
+                _dbg_pe = sum(v.get("pe_oi",0) for v in _dbg_chain.values())
+                _dbg_cv = sum(v.get("ce_vol",0) for v in _dbg_chain.values())
+                _dbg_pv = sum(v.get("pe_vol",0) for v in _dbg_chain.values())
+                if _dbg_ce > 0:
+                    _quick_pcr = round(_dbg_pe / _dbg_ce, 2)
+                    pcr_str = f"➡️ PCR: {_quick_pcr} (live)"
+                    st.session_state.pcr = _quick_pcr
+                elif _dbg_cv > 0:
+                    _quick_pcr = round(_dbg_pv / _dbg_cv, 2)
+                    pcr_str = f"➡️ PCR: {_quick_pcr} (vol)"
+                    st.session_state.pcr = _quick_pcr
+                else:
+                    pcr_str = f"PCR: loading... (OI:{_dbg_ce} V:{_dbg_cv})"
+            else:
+                pcr_str = "PCR: waiting for chain..."
         st.caption(f"{vix_str}  |  {pcr_str}")
 with h3:
     st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")

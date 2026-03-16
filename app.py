@@ -2,6 +2,11 @@
 Multi-Index Live Scalper Dashboard
 Upstox REST Market Quote API -- works on Streamlit Cloud
 ---------------------------------------------------------
+Auto features:
+  - IV pulled live from India VIX
+  - DTE calculated from current date to weekly expiry
+  - Refresh rate adapts to market session (fast open/close, slow midday)
+
 SETUP:
   1. pip install -r requirements.txt
   2. Create .streamlit/secrets.toml:
@@ -11,7 +16,7 @@ SETUP:
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, date, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -39,39 +44,43 @@ except Exception:
 
 # ==============================================================
 # 3. INDEX METADATA
-#
-#    instrument_key   -- sent TO the API  (pipe separator)
-#    response_key     -- returned BY the API (colon separator)
-#    Both are stored so we can match response data correctly.
 # ==============================================================
 INDEX_CONFIG = {
     "NIFTY 50": {
         "instrument_key": "NSE_INDEX|Nifty 50",
         "response_key":   "NSE_INDEX:Nifty 50",
-        "lot_size": 75,
-        "strike_step": 50,
+        "lot_size":       75,
+        "strike_step":    50,
+        "expiry_weekday": 3,    # Thursday
     },
     "BANK NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Bank",
         "response_key":   "NSE_INDEX:Nifty Bank",
-        "lot_size": 30,
-        "strike_step": 100,
+        "lot_size":       30,
+        "strike_step":    100,
+        "expiry_weekday": 2,    # Wednesday
     },
     "FINNIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Fin Service",
         "response_key":   "NSE_INDEX:Nifty Fin Service",
-        "lot_size": 65,
-        "strike_step": 50,
+        "lot_size":       65,
+        "strike_step":    50,
+        "expiry_weekday": 2,    # Tuesday (index 1) -- adjust if needed
     },
     "MIDCAP NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Midcap Select",
         "response_key":   "NSE_INDEX:Nifty Midcap Select",
-        "lot_size": 120,
-        "strike_step": 25,
+        "lot_size":       120,
+        "strike_step":    25,
+        "expiry_weekday": 0,    # Monday
     },
 }
 
 ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
+
+# India VIX -- fetched alongside index prices
+VIX_INSTRUMENT_KEY = "NSE_INDEX|India VIX"
+VIX_RESPONSE_KEY   = "NSE_INDEX:India VIX"
 
 # ==============================================================
 # 4. SESSION STATE INIT
@@ -80,11 +89,57 @@ if "token_ok"    not in st.session_state: st.session_state.token_ok    = None
 if "token_msg"   not in st.session_state: st.session_state.token_msg   = ""
 if "live_feed"   not in st.session_state: st.session_state.live_feed   = False
 if "last_prices" not in st.session_state: st.session_state.last_prices = {}
+if "last_vix"    not in st.session_state: st.session_state.last_vix    = None
 
 # ==============================================================
-# 5. PRICE FETCH
-#    API returns data as plain dicts with colon-separated keys.
-#    e.g. { "NSE_INDEX:Nifty 50": {"last_price": 22400, "ohlc": {...}} }
+# 5. AUTO DTE
+# ==============================================================
+def get_dte(expiry_weekday):
+    """
+    Returns (dte_days, expiry_date) for the next weekly expiry.
+    Rolls to the following week if today IS the expiry day and
+    market has closed (after 15:30 IST).
+    """
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today   = now_ist.date()
+
+    days_ahead = expiry_weekday - today.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    elif days_ahead == 0:
+        # Today is expiry -- roll after 15:30 IST
+        if now_ist.hour >= 15 and now_ist.minute >= 30:
+            days_ahead = 7
+
+    expiry_date = today + timedelta(days=days_ahead)
+    dte_days    = (expiry_date - today).days
+    return dte_days, expiry_date
+
+
+# ==============================================================
+# 6. AUTO REFRESH RATE
+# ==============================================================
+def get_refresh_ms():
+    """
+    Fast (1s) near open/close, normal (2s) midday, slow (3s) pre-market.
+    Based on IST time.
+    """
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    h, m    = now_ist.hour, now_ist.minute
+    t       = h * 60 + m    # minutes since midnight IST
+
+    if 555 <= t <= 570:     # 9:15 - 9:30 IST  (opening volatility)
+        return 1000
+    elif 870 <= t <= 930:   # 14:30 - 15:30 IST (closing volatility)
+        return 1000
+    elif 555 <= t <= 930:   # market hours midday
+        return 2000
+    else:
+        return 3000         # outside market hours
+
+
+# ==============================================================
+# 7. PRICE FETCH  (index prices + VIX in one call)
 # ==============================================================
 def fetch_all_prices(token):
     try:
@@ -92,41 +147,49 @@ def fetch_all_prices(token):
         conf.access_token = token
         api  = upstox_client.MarketQuoteApi(upstox_client.ApiClient(conf))
 
-        keys_str = ",".join(ALL_INSTRUMENT_KEYS)
+        # Fetch all indices + VIX in a single API call
+        all_keys = ALL_INSTRUMENT_KEYS + [VIX_INSTRUMENT_KEY]
+        keys_str = ",".join(all_keys)
         res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
 
         prices = {}
+        vix    = None
+
         if res.status == "success" and res.data:
             for response_key, quote in res.data.items():
-                # quote is a plain dict
                 if isinstance(quote, dict):
-                    ltp  = quote.get("last_price")
-                    ohlc = quote.get("ohlc", {})
+                    ltp   = quote.get("last_price")
+                    ohlc  = quote.get("ohlc", {})
                     close = ohlc.get("close") if isinstance(ohlc, dict) else None
                 else:
-                    # fallback: object with attributes
                     ltp   = getattr(quote, "last_price", None)
                     ohlc  = getattr(quote, "ohlc", None)
-                    close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
+                    close = (ohlc.get("close") if isinstance(ohlc, dict)
+                             else getattr(ohlc, "close", None))
 
                 if ltp is None:
                     continue
 
-                ltp   = float(ltp)
-                close = float(close) if close else ltp
+                ltp        = float(ltp)
+                close      = float(close) if close else ltp
                 change_pct = round(((ltp - close) / close) * 100, 2) if close else 0.0
 
-                prices[response_key] = {
+                entry = {
                     "ltp":        ltp,
                     "close":      close,
                     "change_pct": change_pct,
                     "ts":         datetime.now(),
                 }
 
-        return prices, None
+                if response_key == VIX_RESPONSE_KEY:
+                    vix = ltp    # VIX is quoted as a percentage e.g. 13.5
+                else:
+                    prices[response_key] = entry
+
+        return prices, vix, None
 
     except Exception as e:
-        return {}, str(e)
+        return {}, None, str(e)
 
 
 def validate_token(token):
@@ -140,7 +203,7 @@ def validate_token(token):
         return False, str(e)
 
 # ==============================================================
-# 6. GREEKS ENGINE
+# 8. GREEKS ENGINE
 # ==============================================================
 def greeks(S, K, T, r, sigma, option_type):
     if T <= 0 or sigma <= 0 or S <= 0:
@@ -169,7 +232,7 @@ def greeks(S, K, T, r, sigma, option_type):
     )
 
 # ==============================================================
-# 7. HELPERS
+# 9. HELPERS
 # ==============================================================
 def fmt_inr(v):
     if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
@@ -180,7 +243,17 @@ def sign_str(v):
     return f"+{v}" if v >= 0 else str(v)
 
 # ==============================================================
-# 8. SIDEBAR
+# 10. COMPUTE AUTO VALUES
+# ==============================================================
+conf_selected = None   # set after sidebar
+
+# Auto DTE (computed before sidebar so we can show it)
+# We'll recompute after index selection; placeholder here
+_now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+_refresh  = get_refresh_ms()
+
+# ==============================================================
+# 11. SIDEBAR
 # ==============================================================
 with st.sidebar:
     st.markdown("## Scalper Controls")
@@ -188,6 +261,9 @@ with st.sidebar:
 
     selected_index = st.selectbox("Index", list(INDEX_CONFIG.keys()))
     conf = INDEX_CONFIG[selected_index]
+
+    # Auto DTE for selected index
+    auto_dte, expiry_date = get_dte(conf["expiry_weekday"])
 
     st.divider()
     st.markdown("### Strategy")
@@ -198,20 +274,41 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Greeks Parameters")
-    iv_pct    = st.slider("Implied Volatility (%)", 5,  80, 15, step=1)
-    iv        = iv_pct / 100.0
-    dte_days  = st.slider("Days to Expiry",          0,  30,  4, step=1)
-    dte       = dte_days / 365.0
-    risk_free = st.slider("Risk-Free Rate (%)",       4,  12,  7, step=1)
+
+    # IV -- show live VIX value, allow manual override
+    vix_display = (f"India VIX: {st.session_state.last_vix:.2f}%"
+                   if st.session_state.last_vix else "India VIX: fetching...")
+    st.caption(f"Auto IV from {vix_display}")
+
+    auto_iv_pct = round(st.session_state.last_vix, 1) if st.session_state.last_vix else 15.0
+    iv_pct = st.slider(
+        "Implied Volatility (%)",
+        min_value=5, max_value=80,
+        value=int(auto_iv_pct),
+        step=1,
+        help="Auto-set from India VIX. Override manually if needed.",
+    )
+    iv = iv_pct / 100.0
+
+    # DTE -- show auto value, allow manual override
+    st.caption(f"Auto DTE: {auto_dte}d to expiry ({expiry_date.strftime('%d %b')})")
+    dte_days = st.slider(
+        "Days to Expiry",
+        min_value=0, max_value=30,
+        value=auto_dte,
+        step=1,
+        help="Auto-set from weekly expiry calendar. Override if needed.",
+    )
+    dte = dte_days / 365.0
+
+    risk_free = st.slider("Risk-Free Rate (%)", 4, 12, 7, step=1)
     r         = risk_free / 100.0
 
     st.divider()
-    refresh_ms = st.select_slider(
-        "Refresh Interval",
-        options=[1000, 2000, 3000, 5000],
-        value=2000,
-        format_func=lambda x: f"{x}ms",
-    )
+
+    # Auto refresh display
+    st.caption(f"Auto refresh: {_refresh}ms "
+               f"({'fast' if _refresh == 1000 else 'normal' if _refresh == 2000 else 'slow'})")
 
     st.divider()
     st.markdown("### Connection")
@@ -230,21 +327,23 @@ with st.sidebar:
         st.caption("Press Check Token to validate")
 
     st.divider()
-    st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
+    st.caption("Market: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
 # ==============================================================
-# 9. FETCH PRICES
+# 12. FETCH PRICES
 # ==============================================================
 fetch_error = None
 
 if run_live:
-    prices, fetch_error = fetch_all_prices(TOKEN)
+    prices, vix, fetch_error = fetch_all_prices(TOKEN)
     if prices:
         st.session_state.last_prices = prices
+    if vix is not None:
+        st.session_state.last_vix = vix
 
 # Use last known prices if current fetch empty
 all_prices = st.session_state.last_prices
-rkey       = conf["response_key"]       # colon-format key to look up in response
+rkey       = conf["response_key"]
 feed_entry = all_prices.get(rkey)
 
 if feed_entry:
@@ -255,14 +354,14 @@ else:
     spot = change_pct = data_age = None
 
 # ==============================================================
-# 10. PAGE HEADER
+# 13. PAGE HEADER
 # ==============================================================
 st.markdown(f"# {selected_index} Scalper")
 
-h1, h2, h3 = st.columns([2, 2, 3])
+h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
 with h1:
     if run_live and fetch_error:
-        st.caption(f"🔴 API error: {fetch_error}")
+        st.caption(f"🔴 {fetch_error[:40]}")
     elif run_live and spot:
         st.caption("🟢 Live")
     elif run_live:
@@ -273,12 +372,15 @@ with h2:
     if data_age is not None:
         st.caption(f"Updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
 with h3:
-    st.caption(f"Instrument: `{conf['instrument_key']}`")
+    if st.session_state.last_vix:
+        st.caption(f"VIX: {st.session_state.last_vix:.2f}%  |  IV: {iv_pct}%")
+with h4:
+    st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
 
 st.divider()
 
 # ==============================================================
-# 11. TOP METRICS
+# 14. TOP METRICS
 # ==============================================================
 step = conf["strike_step"]
 
@@ -299,12 +401,12 @@ m1.metric(
 m2.metric("ATM Strike",     f"{atm:,}"        if atm     else "--")
 m3.metric("Total Exposure", fmt_inr(exposure) if exposure else "--",
           f"{lots} lot x {conf['lot_size']}"  if exposure else None)
-m4.metric("DTE", f"{dte_days}d", f"IV {iv_pct}%")
+m4.metric("DTE / Expiry",   f"{dte_days}d",   expiry_date.strftime("%d %b %Y"))
 
 st.divider()
 
 # ==============================================================
-# 12. GREEKS PANELS
+# 15. GREEKS PANELS
 # ==============================================================
 if spot and atm:
     g_ce = greeks(spot, ce_strike, dte, r, iv, "call")
@@ -381,7 +483,7 @@ else:
         st.info("Fetching prices... Market must be open (9:15 AM - 3:30 PM IST).")
 
 # ==============================================================
-# 13. ALL-INDEX OVERVIEW
+# 16. ALL-INDEX OVERVIEW
 # ==============================================================
 if run_live and all_prices:
     st.divider()
@@ -390,11 +492,13 @@ if run_live and all_prices:
     for idx_name, idx_conf in INDEX_CONFIG.items():
         entry = all_prices.get(idx_conf["response_key"])
         if entry:
+            dte_i, exp_i = get_dte(idx_conf["expiry_weekday"])
             rows.append({
                 "Index":       idx_name,
                 "LTP":         f"Rs.{entry['ltp']:,.2f}",
-                "Prev Close":  f"Rs.{entry['close']:,.2f}",
                 "Change %":    f"{entry['change_pct']:+.2f}%",
+                "Expiry":      exp_i.strftime("%d %b"),
+                "DTE":         dte_i,
                 "Last Update": entry["ts"].strftime("%H:%M:%S"),
             })
     if rows:
@@ -403,8 +507,8 @@ if run_live and all_prices:
         st.caption("No data yet. Market must be open.")
 
 # ==============================================================
-# 14. AUTO-REFRESH
+# 17. AUTO-REFRESH  (rate adapts to market session)
 # ==============================================================
 if run_live:
-    time.sleep(refresh_ms / 1000)
+    time.sleep(_refresh / 1000)
     st.rerun()

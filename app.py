@@ -6,10 +6,11 @@ import upstox_client
 import requests
 import time
 
-# --- 1. CONFIGURATION (REPLACE THESE) ---
-API_KEY = "YOUR_API_KEY_HERE"
-API_SECRET = "YOUR_API_SECRET_HERE"
-REDIRECT_URI = "http://localhost:8501"
+# --- 1. CONFIGURATION (FETCHED FROM SECRETS) ---
+# Ensure these match the keys in your secrets.toml
+API_KEY = st.secrets["upstox"]["api_key"]
+API_SECRET = st.secrets["upstox"]["api_secret"]
+REDIRECT_URI = st.secrets["upstox"]["redirect_uri"]
 
 # --- 2. OPTION GREEKS ENGINE ---
 def calculate_greeks(S, K, T, r, sigma, type="call"):
@@ -44,58 +45,51 @@ def get_live_spot(token):
     config.access_token = token
     api_instance = upstox_client.MarketQuoteApi(upstox_client.ApiClient(config))
     try:
-        # Correct Instrument Key for Nifty 50 Spot
         instrument_key = "NSE_INDEX|Nifty 50"
         res = api_instance.ltp(instrument_key, 'v2')
         return res.data[instrument_key].last_price
-    except Exception as e:
+    except Exception:
         return None
 
 # --- 4. UI SETUP ---
 st.set_page_config(page_title="Pro Nifty Scalper", layout="wide")
 
-# Sidebar: Auth & Risk Management
 with st.sidebar:
     st.title("🔑 Upstox Login")
     
-    # Check for 'code' in the browser URL
-    query_params = st.query_params
-    auth_code = query_params.get("code")
+    # Handle OAuth2 Code from URL
+    auth_code = st.query_params.get("code")
     
     if 'token' not in st.session_state:
         if not auth_code:
-            # FIXED URL STRUCTURE: Added missing slashes and question marks
+            # FIXED URL formatting
             login_url = f"https://api.upstox.com{API_KEY}&redirect_uri={REDIRECT_URI}"
             st.link_button("Authorize Upstox", login_url, type="primary")
-            st.warning("Please click above to login.")
             st.stop()
         else:
-            with st.spinner("Generating Token..."):
+            with st.spinner("Authenticating..."):
                 token = get_access_token(auth_code)
                 if token:
                     st.session_state.token = token
-                    st.success("Authenticated!")
-                    st.rerun() # Refresh to clean URL parameters
+                    st.rerun()
                 else:
-                    st.error("Authentication Failed. Check API Keys.")
+                    st.error("Failed to fetch token. Check secrets.toml values.")
                     st.stop()
     
-    if st.button("Logout / Reset"):
+    if st.button("Logout"):
         st.session_state.clear()
         st.query_params.clear()
         st.rerun()
 
     st.divider()
-    st.header("🛡️ Risk & Strategy")
+    st.header("🛡️ Strategy Settings")
     lots = st.number_input("Lots", min_value=1, value=1)
-    sl_val = st.number_input("Stop Loss (Points)", value=15.0)
+    sl_val = st.number_input("Stop Loss (Pts)", value=15.0)
     mode = st.selectbox("Strike Mode", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[mode]
 
-# --- 5. MAIN DASHBOARD ---
+# --- 5. LIVE DASHBOARD ---
 st.title("🚀 Nifty Live Scalper")
-
-# Placeholder for real-time updates
 placeholder = st.empty()
 
 if 'token' in st.session_state:
@@ -108,30 +102,24 @@ if 'token' in st.session_state:
             pe_strike = atm + (offset * 50)
             
             with placeholder.container():
-                # Top Metrics
-                col_m1, col_m2, col_m3 = st.columns(3)
-                col_m1.metric("NIFTY 50 SPOT", f"₹{spot}")
-                col_m2.metric("NET EXPOSURE", f"₹{spot * lots * 50:,.0f}")
-                col_m3.metric("ATM STRIKE", atm)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("NIFTY SPOT", f"₹{spot}")
+                c2.metric("EXPOSURE", f"₹{spot * lots * 50:,.0f}")
+                c3.metric("ATM STRIKE", atm)
                 
                 st.divider()
                 
-                # Trading Cards
-                c1, c2 = st.columns(2)
-                
-                with c1:
-                    st.success(f"🟢 CALL OPTION: {ce_strike} CE")
+                col_ce, col_pe = st.columns(2)
+                with col_ce:
+                    st.success(f"🟢 {ce_strike} CE")
                     g = calculate_greeks(spot, ce_strike, 4/365, 0.07, 0.15, "call")
-                    st.info(f"**Greeks:** Δ: {g['delta']} | Γ: {g['gamma']} | Θ: {g['theta']}")
-                    st.caption(f"Suggested Exit: ₹{sl_val} pts Stop Loss")
+                    st.info(f"Δ: {g['delta']} | Θ: {g['theta']}")
+                    st.caption(f"Exit if price drops {sl_val} pts")
 
-                with c2:
-                    st.error(f"🔴 PUT OPTION: {pe_strike} PE")
+                with col_pe:
+                    st.error(f"🔴 {pe_strike} PE")
                     g = calculate_greeks(spot, pe_strike, 4/365, 0.07, 0.15, "put")
-                    st.info(f"**Greeks:** Δ: {g['delta']} | Γ: {g['gamma']} | Θ: {g['theta']}")
-                    st.caption(f"Suggested Exit: ₹{sl_val} pts Stop Loss")
-        else:
-            st.error("Unable to fetch live data. Ensure market is open or check API status.")
-            break
+                    st.info(f"Δ: {g['delta']} | Θ: {g['theta']}")
+                    st.caption(f"Exit if price drops {sl_val} pts")
         
-        time.sleep(3) # Refresh speed (Upstox rate limits apply)
+        time.sleep(3)

@@ -97,6 +97,8 @@ defaults = {
     "fii_data":     None,
     "opt_candles":  {},
     "opt_candle_ts": None,
+    "prev_closes":   {},    # prev day closing prices per instrument
+    "prev_closes_ts": None,
     "active_trade":  None,   # current saved trade
     "trade_log":     [],     # list of completed trades
     "trade_saved_at": None,  # datetime trade was saved
@@ -145,6 +147,45 @@ def is_high_volatility_window():
 # ==============================================================
 # 6. API: SPOT PRICES + VIX
 # ==============================================================
+def fetch_prev_day_close(token, instrument_keys):
+    """
+    Fetches the previous trading day closing price for each key
+    using the historical daily candle API.
+    Returns dict: instrument_key -> prev_close float
+    """
+    from datetime import timezone as _tz
+    prev_closes = {}
+    try:
+        conf = upstox_client.Configuration()
+        conf.access_token = token
+        hist_api = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
+
+        # Date range: fetch last 5 days to guarantee we get at least 2 trading days
+        now_ist  = datetime.now(_tz.utc) + timedelta(hours=5, minutes=30)
+        to_date  = now_ist.date()
+        from_date = to_date - timedelta(days=7)
+
+        for ikey in instrument_keys:
+            try:
+                res = hist_api.get_historical_candle_data(
+                    ikey, "days", "1",
+                    str(to_date), str(from_date)
+                )
+                if res.status == "success" and res.data and res.data.candles:
+                    candles = res.data.candles
+                    # candles are [ts, open, high, low, close, vol, oi]
+                    # sorted newest first — index 1 = yesterday's close
+                    if len(candles) >= 2:
+                        prev_closes[ikey] = float(candles[1][4])
+                    elif len(candles) == 1:
+                        prev_closes[ikey] = float(candles[0][4])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return prev_closes
+
+
 def fetch_all_prices(token):
     try:
         conf = upstox_client.Configuration()
@@ -159,15 +200,17 @@ def fetch_all_prices(token):
                 q     = quote if isinstance(quote, dict) else (quote.to_dict() if hasattr(quote, "to_dict") else {})
                 ltp   = q.get("last_price") or getattr(quote, "last_price", None)
                 ohlc  = q.get("ohlc", {}) or {}
-                close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
+                # today's open from OHLC (available intraday)
+                today_open = ohlc.get("open") if isinstance(ohlc, dict) else getattr(ohlc, "open", None)
                 if ltp is None:
                     continue
-                ltp   = float(ltp)
-                close = float(close) if close else ltp
+                ltp        = float(ltp)
+                today_open = float(today_open) if today_open else ltp
                 entry = {
                     "ltp":        ltp,
-                    "close":      close,
-                    "change_pct": round(((ltp - close) / close) * 100, 2) if close else 0.0,
+                    "today_open": today_open,
+                    "close":      today_open,   # placeholder; real prev close fetched separately
+                    "change_pct": 0.0,          # updated after prev_closes fetched
                     "ts":         datetime.now(),
                 }
                 if rkey == VIX_RESPONSE_KEY:
@@ -959,6 +1002,31 @@ with st.sidebar:
 if run_live:
     prices, vix, _ = fetch_all_prices(TOKEN)
     if prices:
+        # Fetch prev day closes once per session (or if stale > 30 min)
+        _pc_ts  = st.session_state.prev_closes_ts
+        _pc_age = (datetime.now() - _pc_ts).total_seconds() if _pc_ts else 9999
+        if _pc_age > 1800 or not st.session_state.prev_closes:
+            _ikeys = [v["instrument_key"] for v in INDEX_CONFIG.values()]
+            _prev  = fetch_prev_day_close(TOKEN, _ikeys)
+            if _prev:
+                st.session_state.prev_closes    = _prev
+                st.session_state.prev_closes_ts = datetime.now()
+
+        # Enrich each price entry with real prev-day close and change %
+        _pc = st.session_state.prev_closes
+        for rkey, entry in prices.items():
+            # Match response key (colon) to instrument key (pipe)
+            _ikey = rkey.replace(":", "|")
+            prev_close = _pc.get(_ikey)
+            if prev_close and prev_close > 0:
+                entry["close"]      = prev_close
+                entry["change_pct"] = round(((entry["ltp"] - prev_close) / prev_close) * 100, 2)
+            else:
+                # Fallback: use today's open as approx prev close
+                entry["change_pct"] = round(
+                    ((entry["ltp"] - entry["today_open"]) / entry["today_open"]) * 100, 2
+                ) if entry.get("today_open") else 0.0
+
         st.session_state.last_prices = prices
     if vix:
         st.session_state.last_vix = vix

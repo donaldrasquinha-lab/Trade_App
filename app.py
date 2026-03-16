@@ -97,6 +97,9 @@ defaults = {
     "fii_data":     None,
     "opt_candles":  {},
     "opt_candle_ts": None,
+    "active_trade":  None,   # current saved trade
+    "trade_log":     [],     # list of completed trades
+    "trade_saved_at": None,  # datetime trade was saved
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -1361,6 +1364,71 @@ signal = generate_signal(
     oi_score_bonus=_oi_score_bonus,
 )
 
+
+# ==============================================================
+# TRADE SAVE LOGIC
+# Saves the best option when a strong signal fires.
+# Holds it for the selected candle_interval in minutes.
+# Auto-expires after the interval, marks as completed.
+# ==============================================================
+_interval_mins = int(candle_interval)
+_now           = datetime.now()
+
+# Check if active trade has expired
+if st.session_state.active_trade and st.session_state.trade_saved_at:
+    _elapsed = (_now - st.session_state.trade_saved_at).total_seconds() / 60
+    if _elapsed >= _interval_mins:
+        # Move to trade log with exit info
+        _trade = dict(st.session_state.active_trade)
+        _trade["exit_time"]  = _now.strftime("%H:%M:%S")
+        _trade["exit_price"] = (ce_ltp if _trade["type"] == "CE" else pe_ltp) or _trade["entry_premium"]
+        _trade["pnl"]        = round(
+            (_trade["exit_price"] - _trade["entry_premium"])
+            * (_trade["lots"] * _trade["lot_size"])
+            * (1 if _trade["type"] == "CE" else 1),
+            2
+        )
+        _trade["status"]     = "Completed"
+        st.session_state.trade_log.insert(0, _trade)
+        st.session_state.active_trade  = None
+        st.session_state.trade_saved_at = None
+        # Keep last 20 trades only
+        st.session_state.trade_log = st.session_state.trade_log[:20]
+
+# Auto-save new trade when signal is strong and no active trade
+if (signal and spot and atm
+        and signal["direction"] in ("CE", "PE")
+        and signal["confidence"] in ("High", "Medium")
+        and not st.session_state.active_trade
+        and run_live):
+    _opt_type  = signal["direction"]
+    _opt_strike = ce_strike if _opt_type == "CE" else pe_strike
+    _opt_ltp   = ce_ltp    if _opt_type == "CE" else pe_ltp
+    _opt_delta = g_ce["delta"] if (_opt_type == "CE" and g_ce) else (g_pe["delta"] if g_pe else "--")
+    _opt_iv    = g_ce["iv"]    if (_opt_type == "CE" and g_ce) else (g_pe["iv"]    if g_pe else iv_pct)
+    if _opt_ltp and _opt_ltp > 0:
+        st.session_state.active_trade = {
+            "index":         selected_index,
+            "type":          _opt_type,
+            "strike":        _opt_strike,
+            "entry_premium": _opt_ltp,
+            "entry_spot":    spot,
+            "target_spot":   signal["target"],
+            "sl_spot":       signal["stop_loss"],
+            "delta":         _opt_delta,
+            "iv":            _opt_iv,
+            "confidence":    signal["confidence"],
+            "score":         signal["score"],
+            "scenario":      _oi_momentum["scenario"] if _oi_momentum else "--",
+            "lots":          lots,
+            "lot_size":      conf["lot_size"],
+            "interval_mins": _interval_mins,
+            "entry_time":    _now.strftime("%H:%M:%S"),
+            "expiry_at":     (_now + pd.Timedelta(minutes=_interval_mins)).strftime("%H:%M:%S"),
+            "status":        "Active",
+        }
+        st.session_state.trade_saved_at = _now
+
 # ==============================================================
 # 18. PAGE HEADER + MARKET OUTLOOK
 # ==============================================================
@@ -1506,6 +1574,91 @@ with st.expander("📊 Market Outlook Summary", expanded=True):
         )
 
 st.divider()
+
+# ==============================================================
+# ACTIVE TRADE CARD + TRADE LOG
+# ==============================================================
+
+# ── Active trade sticky card ─────────────────────────────────
+_at = st.session_state.active_trade
+if _at:
+    _elapsed_mins = round(
+        (_now - st.session_state.trade_saved_at).total_seconds() / 60, 1
+    ) if st.session_state.trade_saved_at else 0
+    _remaining    = max(0, _at["interval_mins"] - _elapsed_mins)
+    _progress_pct = min(int(_elapsed_mins / _at["interval_mins"] * 100), 100)
+    _progress_bar = "█" * (_progress_pct // 10) + "░" * (10 - _progress_pct // 10)
+    _cur_premium  = (ce_ltp if _at["type"] == "CE" else pe_ltp) or _at["entry_premium"]
+    _cur_pnl      = round((_cur_premium - _at["entry_premium"]) * _at["lots"] * _at["lot_size"], 2)
+    _pnl_col      = "#00c853" if _cur_pnl >= 0 else "#f44336"
+    _type_col     = "#00c853" if _at["type"] == "CE" else "#f44336"
+    _type_bg      = "#0d3320" if _at["type"] == "CE" else "#3d0a0a"
+
+    st.markdown(
+        f'<div style="background:{_type_bg};border:2px solid {_type_col};'        f'border-radius:12px;padding:16px 20px;margin-bottom:12px;">'        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'        f'<div>'        f'<span style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">🔴 Active Trade</span>'        f'<div style="font-size:22px;font-weight:700;color:{_type_col};margin-top:2px;">'        f'{_at["index"]} {_at["strike"]:,} {_at["type"]} &nbsp;'        f'<span style="font-size:13px;background:{_type_bg};border:1px solid {_type_col};'        f'padding:2px 8px;border-radius:4px;">{_at["confidence"]}</span>'        f'</div></div>'        f'<div style="text-align:right;">'        f'<div style="font-size:11px;color:#aaa;">Entry: {_at["entry_time"]} &nbsp;|&nbsp; Expires: {_at["expiry_at"]}</div>'        f'<div style="font-size:11px;color:#aaa;margin-top:2px;">{_at["interval_mins"]}m interval &nbsp;|&nbsp; {_at["lots"]} lot</div>'        f'</div></div>'        f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px;">'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Entry Premium</div>'        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_at["entry_premium"]:.1f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Current Premium</div>'        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_cur_premium:.1f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Unrealised P&L</div>'        f'<div style="font-size:16px;font-weight:600;color:{_pnl_col};">'        f'{"+" if _cur_pnl >= 0 else ""}Rs.{_cur_pnl:.0f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Target Spot</div>'        f'<div style="font-size:16px;font-weight:600;color:#00c853;">{_at["target_spot"] or "--"}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Stop-Loss</div>'        f'<div style="font-size:16px;font-weight:600;color:#f44336;">{_at["sl_spot"] or "--"}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">OI Scenario</div>'        f'<div style="font-size:13px;font-weight:600;color:white;">{_at["scenario"]}</div></div>'        f'</div>'        f'<div style="display:flex;align-items:center;gap:10px;">'        f'<span style="font-size:11px;color:#aaa;">Time elapsed:</span>'        f'<span style="font-family:monospace;color:{_type_col};">{_progress_bar}</span>'        f'<span style="font-size:11px;color:#aaa;">{_elapsed_mins:.1f}m / {_at["interval_mins"]}m'        f'&nbsp; ({_remaining:.1f}m remaining)</span>'        f'</div></div>',
+        unsafe_allow_html=True
+    )
+
+    # Manual exit button
+    col_exit, col_void = st.columns([1, 4])
+    with col_exit:
+        if st.button("🚪 Exit Trade Now", type="primary"):
+            _trade = dict(_at)
+            _trade["exit_time"]  = _now.strftime("%H:%M:%S")
+            _trade["exit_price"] = _cur_premium
+            _trade["pnl"]        = _cur_pnl
+            _trade["status"]     = "Exited"
+            st.session_state.trade_log.insert(0, _trade)
+            st.session_state.active_trade   = None
+            st.session_state.trade_saved_at = None
+            st.session_state.trade_log = st.session_state.trade_log[:20]
+            st.rerun()
+
+    st.divider()
+
+# ── Trade Log ────────────────────────────────────────────────
+if st.session_state.trade_log:
+    with st.expander(f"📋 Trade Log ({len(st.session_state.trade_log)} trades)", expanded=False):
+        log_rows = []
+        for t in st.session_state.trade_log:
+            pnl_str = f'{"+" if t.get("pnl",0) >= 0 else ""}Rs.{t.get("pnl",0):.0f}'
+            log_rows.append({
+                "Time":     t.get("entry_time", "--"),
+                "Index":    t.get("index", "--"),
+                "Option":   f'{t.get("strike","")} {t.get("type","")}',
+                "Entry":    f'Rs.{t.get("entry_premium",0):.1f}',
+                "Exit":     f'Rs.{t.get("exit_price",0):.1f}',
+                "P&L":      pnl_str,
+                "Status":   t.get("status", "--"),
+                "Scenario": t.get("scenario", "--"),
+                "Interval": f'{t.get("interval_mins","?")}m',
+            })
+        df_log = pd.DataFrame(log_rows)
+
+        def color_pnl(val):
+            if val.startswith("+"):  return "color: #00c853; font-weight: 600"
+            if val.startswith("-"):  return "color: #f44336; font-weight: 600"
+            return ""
+
+        st.dataframe(
+            df_log.style.map(color_pnl, subset=["P&L"]),
+            width="stretch", hide_index=True
+        )
+        # Summary
+        total_pnl = sum(t.get("pnl", 0) for t in st.session_state.trade_log)
+        wins      = sum(1 for t in st.session_state.trade_log if t.get("pnl", 0) > 0)
+        losses    = sum(1 for t in st.session_state.trade_log if t.get("pnl", 0) < 0)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Total P&L",   f'{"+" if total_pnl >= 0 else ""}Rs.{total_pnl:.0f}')
+        s2.metric("Trades",      len(st.session_state.trade_log))
+        s3.metric("Wins",        wins)
+        s4.metric("Losses",      losses)
+
+        if st.button("🗑️ Clear Log"):
+            st.session_state.trade_log = []
+            st.rerun()
+
+    st.divider()
 
 # ==============================================================
 # 19. BEST TO BUY NOW  (prominent recommendation card)

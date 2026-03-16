@@ -12,7 +12,7 @@ SETUP:
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -67,29 +67,43 @@ INDEX_CONFIG = {
 ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 
 # ==============================================================
-# 4. MODULE-LEVEL SHARED STATE
-#    Single-element lists -- safely mutated from daemon threads
-#    without `global` declarations or st.session_state access.
+# 4. PERSISTENT SHARED STATE
+#
+#    On Streamlit Cloud the module is reloaded between reruns,
+#    so module-level variables reset every cycle. Instead we
+#    store mutable container objects in st.session_state once,
+#    then pass direct references to threads at creation time.
+#    The thread holds its own reference to the same dict/list
+#    object in memory -- session_state reloads don't affect it.
 # ==============================================================
-_price_feed = {}               # ikey -> {ltp, close, change_pct, ts}
-_ws_status  = ["disconnected"] # connecting | live | error:<msg> | disconnected
-_ws_started = [False]
+if "price_feed" not in st.session_state:
+    st.session_state.price_feed = {}       # ikey -> {ltp, close, change_pct, ts}
+
+if "ws_status" not in st.session_state:
+    st.session_state.ws_status = ["disconnected"]  # single-element list
+
+if "ws_started" not in st.session_state:
+    st.session_state.ws_started = [False]          # single-element list
+
+if "do_reconnect" not in st.session_state:
+    st.session_state.do_reconnect = False
+
+if "token_ok" not in st.session_state:
+    st.session_state.token_ok = None
+
+if "token_msg" not in st.session_state:
+    st.session_state.token_msg = ""
+
+if "live_feed" not in st.session_state:
+    st.session_state.live_feed = False
+
+# Local aliases -- convenient shorthand, same objects in memory
+_price_feed = st.session_state.price_feed
+_ws_status  = st.session_state.ws_status
+_ws_started = st.session_state.ws_started
 
 # ==============================================================
-# 5. SESSION STATE INIT
-# ==============================================================
-defaults = {
-    "do_reconnect": False,
-    "token_ok":     None,
-    "token_msg":    "",
-    "live_feed":    False,    # persistent toggle state across reruns
-}
-for key, val in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
-
-# ==============================================================
-# 6. TOKEN VALIDATION
+# 5. TOKEN VALIDATION
 # ==============================================================
 def validate_token(token):
     try:
@@ -102,15 +116,19 @@ def validate_token(token):
         return False, str(e)
 
 # ==============================================================
-# 7. WEBSOCKET FEED
+# 6. WEBSOCKET FEED
+#
+#    price_feed, ws_status, ws_started are passed in by
+#    reference at thread creation. The thread writes directly
+#    into the same objects that session_state holds -- no
+#    session_state access needed inside the thread itself.
 # ==============================================================
-def _stream_market_data(token, instrument_keys):
+def _stream_market_data(token, instrument_keys, price_feed, ws_status, ws_started):
     """
     Daemon thread.
-    Writes only to module-level _price_feed, _ws_status, _ws_started.
-    Never accesses st.session_state.
+    Receives container objects by reference -- never calls st.anything.
     """
-    _ws_status[0] = "connecting"
+    ws_status[0] = "connecting"
 
     configuration = upstox_client.Configuration()
     configuration.access_token = token
@@ -124,7 +142,7 @@ def _stream_market_data(token, instrument_keys):
     streamer.auto_reconnect(True, 5, 3)
 
     def on_open():
-        _ws_status[0] = "live"
+        ws_status[0] = "live"
 
     def on_message(message):
         try:
@@ -136,7 +154,7 @@ def _stream_market_data(token, instrument_keys):
                     continue
                 ltp = float(ltp)
                 cp  = float(cp) if cp else ltp
-                _price_feed[ikey] = {
+                price_feed[ikey] = {
                     "ltp":        ltp,
                     "close":      cp,
                     "change_pct": round(((ltp - cp) / cp) * 100, 2) if cp else 0.0,
@@ -146,15 +164,15 @@ def _stream_market_data(token, instrument_keys):
             pass
 
     def on_error(error):
-        _ws_status[0] = f"error:{error}"
+        ws_status[0] = f"error:{error}"
 
     def on_close():
-        _ws_status[0] = "disconnected"
-        _ws_started[0] = False
+        ws_status[0]  = "disconnected"
+        ws_started[0] = False
 
     def on_reconnect_stopped(message):
-        _ws_status[0] = f"error:Reconnect stopped -- {message}"
-        _ws_started[0] = False
+        ws_status[0]  = f"error:Reconnect stopped -- {message}"
+        ws_started[0] = False
 
     streamer.on("open",                 on_open)
     streamer.on("message",              on_message)
@@ -165,24 +183,31 @@ def _stream_market_data(token, instrument_keys):
     try:
         streamer.connect()
     except Exception as e:
-        _ws_status[0] = f"error:{e}"
-        _ws_started[0] = False
+        ws_status[0]  = f"error:{e}"
+        ws_started[0] = False
 
 
 def start_feed():
+    """Launch the streamer thread, passing container refs explicitly."""
     if _ws_started[0]:
         return
     _ws_started[0] = True
     _ws_status[0]  = "connecting"
     threading.Thread(
         target=_stream_market_data,
-        args=(TOKEN, ALL_INSTRUMENT_KEYS),
+        args=(
+            TOKEN,
+            ALL_INSTRUMENT_KEYS,
+            _price_feed,    # pass reference -- thread writes into this object
+            _ws_status,     # pass reference
+            _ws_started,    # pass reference
+        ),
         daemon=True,
         name="upstox-streamer",
     ).start()
 
 # ==============================================================
-# 8. GREEKS ENGINE
+# 7. GREEKS ENGINE
 # ==============================================================
 def greeks(S, K, T, r, sigma, option_type):
     if T <= 0 or sigma <= 0 or S <= 0:
@@ -211,7 +236,7 @@ def greeks(S, K, T, r, sigma, option_type):
     )
 
 # ==============================================================
-# 9. HELPERS
+# 8. HELPERS
 # ==============================================================
 def fmt_inr(v):
     if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
@@ -222,7 +247,7 @@ def sign_str(v):
     return f"+{v}" if v >= 0 else str(v)
 
 # ==============================================================
-# 10. SIDEBAR
+# 9. SIDEBAR
 # ==============================================================
 with st.sidebar:
     st.markdown("## Scalper Controls")
@@ -234,12 +259,7 @@ with st.sidebar:
     st.divider()
     st.markdown("### Strategy")
 
-    # Toggle uses session_state key so it persists across st.rerun()
-    run_live = st.toggle(
-        "Start Live Feed",
-        key="live_feed",          # bound to st.session_state["live_feed"]
-    )
-
+    run_live      = st.toggle("Start Live Feed", key="live_feed")
     lots          = st.number_input("Lots", min_value=1, max_value=500, value=1, step=1)
     strike_mode   = st.selectbox("Strike Selection", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     strike_offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
@@ -296,16 +316,15 @@ with st.sidebar:
     st.divider()
     st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
-    # Debug panel -- shows exactly what the app sees each cycle
     with st.expander("Debug Info"):
         st.write(f"run_live: `{run_live}`")
-        st.write(f"_ws_started: `{_ws_started[0]}`")
-        st.write(f"_ws_status: `{_ws_status[0]}`")
+        st.write(f"ws_started: `{_ws_started[0]}`")
+        st.write(f"ws_status: `{_ws_status[0]}`")
         st.write(f"price_feed keys: `{list(_price_feed.keys())}`")
         st.write(f"session live_feed: `{st.session_state.live_feed}`")
 
 # ==============================================================
-# 11. HANDLE RECONNECT
+# 10. HANDLE RECONNECT
 # ==============================================================
 if st.session_state.do_reconnect:
     _ws_started[0] = False
@@ -314,13 +333,13 @@ if st.session_state.do_reconnect:
     st.session_state.do_reconnect = False
 
 # ==============================================================
-# 12. START FEED
+# 11. START FEED
 # ==============================================================
 if run_live and not _ws_started[0]:
     start_feed()
 
 # ==============================================================
-# 13. READ LATEST PRICE
+# 12. READ LATEST PRICE
 # ==============================================================
 ikey       = conf["instrument_key"]
 feed_entry = _price_feed.get(ikey) if run_live else None
@@ -333,7 +352,7 @@ else:
     spot = change_pct = data_age = None
 
 # ==============================================================
-# 14. PAGE HEADER
+# 13. PAGE HEADER
 # ==============================================================
 st.markdown(f"# {selected_index} Scalper")
 
@@ -351,7 +370,7 @@ with h1:
 with h2:
     if data_age is not None:
         st.caption(f"Last tick: {'< 1s' if data_age < 1 else f'{data_age:.1f}s'} ago")
-    elif run_live and s == "live":
+    elif run_live and _ws_status[0] == "live":
         st.caption("Waiting for first tick...")
 with h3:
     st.caption(f"Instrument: `{ikey}`")
@@ -359,7 +378,7 @@ with h3:
 st.divider()
 
 # ==============================================================
-# 15. TOP METRICS
+# 14. TOP METRICS
 # ==============================================================
 step = conf["strike_step"]
 
@@ -385,7 +404,7 @@ m4.metric("DTE", f"{dte_days}d", f"IV {iv_pct}%")
 st.divider()
 
 # ==============================================================
-# 16. GREEKS PANELS
+# 15. GREEKS PANELS
 # ==============================================================
 if spot and atm:
     g_ce = greeks(spot, ce_strike, dte, r, iv, "call")
@@ -462,12 +481,12 @@ else:
     elif s == "live":
         st.info("Connected. Waiting for first tick. Market must be open (9:15 AM - 3:30 PM IST).")
     elif s.startswith("error:"):
-        st.error(f"Feed error: {s[6:]}. Check your token and press Reconnect in the sidebar.")
+        st.error(f"Feed error: {s[6:]}. Check your token and press Reconnect.")
     else:
         st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
-# 17. ALL-INDEX OVERVIEW
+# 16. ALL-INDEX OVERVIEW
 # ==============================================================
 if run_live and _price_feed:
     st.divider()
@@ -489,7 +508,7 @@ if run_live and _price_feed:
         st.caption("Waiting for first tick...")
 
 # ==============================================================
-# 18. AUTO-REFRESH
+# 17. AUTO-REFRESH
 # ==============================================================
 if run_live:
     time.sleep(refresh_ms / 1000)

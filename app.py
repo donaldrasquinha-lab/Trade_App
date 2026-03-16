@@ -55,8 +55,7 @@ with st.sidebar:
     
     if 'token' not in st.session_state:
         if not auth_code:
-            # CORRECT VERSION:
-login_url = f"https://api.upstox.com{API_KEY}&redirect_uri={REDIRECT_URI}"
+            login_url = f"https://api.upstox.com{API_KEY}&redirect_uri={REDIRECT_URI}"
             st.link_button("Authorize Upstox", login_url)
             st.stop()
         else:

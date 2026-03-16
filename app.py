@@ -163,44 +163,55 @@ def fmt_change(ltp, close_price, change_pct, show_pts, pts_diff=None):
 def fetch_prev_day_close(token, instrument_keys):
     """
     Fetches yesterday's official NSE closing price for each index.
-    Uses historical daily candle API — to_date is YESTERDAY so we
-    always get the most recent completed session close.
-    Candle format: [timestamp, open, high, low, close, volume, oi]
+    Tries HistoryV3Api first, falls back to HistoryApi.
+    Stores errors in prev_closes["_errors"] for debug.
     """
     from datetime import timezone as _tz
     prev_closes = {}
-    try:
-        conf = upstox_client.Configuration()
-        conf.access_token = token
-        hist_api = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
+    errors      = {}
 
-        now_ist   = datetime.now(_tz.utc) + timedelta(hours=5, minutes=30)
-        yesterday = now_ist.date() - timedelta(days=1)
-        week_ago  = now_ist.date() - timedelta(days=10)  # wide range for holidays
+    now_ist   = datetime.now(_tz.utc) + timedelta(hours=5, minutes=30)
+    yesterday = now_ist.date() - timedelta(days=1)
+    week_ago  = now_ist.date() - timedelta(days=10)
 
-        for ikey in instrument_keys:
+    conf = upstox_client.Configuration()
+    conf.access_token = token
+    client = upstox_client.ApiClient(conf)
+
+    for ikey in instrument_keys:
+        try:
+            # Try V3 first
             try:
+                hist_api = upstox_client.HistoryV3Api(client)
                 res = hist_api.get_historical_candle_data(
                     ikey, "days", "1",
-                    str(yesterday),   # to_date = yesterday (no partial today candle)
-                    str(week_ago)
+                    str(yesterday), str(week_ago)
                 )
-                if res.status == "success" and res.data and res.data.candles:
-                    candles = res.data.candles
-                    # Sort by timestamp descending so [0] = most recent completed day
-                    candles_sorted = sorted(candles, key=lambda c: c[0], reverse=True)
-                    # candle = [ts, open, high, low, close, volume, oi]
-                    # [0] = most recent completed session
-                    prev_closes[ikey] = float(candles_sorted[0][4])
-                    # Store all candles for debug
-                    prev_closes[ikey + "_debug"] = [
-                        {"ts": str(c[0])[:10], "o": c[1], "h": c[2], "l": c[3], "c": c[4]}
-                        for c in candles_sorted[:3]
-                    ]
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e1:
+                # Fallback to legacy HistoryApi
+                hist_api = upstox_client.HistoryApi(client)
+                res = hist_api.get_historical_candle_data(
+                    ikey, "days", "1",
+                    str(yesterday), str(week_ago), "2.0"
+                )
+
+            if res.status == "success" and res.data and res.data.candles:
+                candles        = res.data.candles
+                candles_sorted = sorted(candles, key=lambda c: c[0], reverse=True)
+                prev_closes[ikey] = float(candles_sorted[0][4])
+                prev_closes[ikey + "_debug"] = [
+                    {"ts": str(c[0])[:10], "open": c[1], "high": c[2],
+                     "low": c[3], "close": c[4]}
+                    for c in candles_sorted[:3]
+                ]
+            else:
+                errors[ikey] = f"API returned: status={getattr(res,'status','?')} data={bool(getattr(res,'data',None))}"
+
+        except Exception as e:
+            errors[ikey] = str(e)
+
+    if errors:
+        prev_closes["_errors"] = errors
     return prev_closes
 
 
@@ -1083,13 +1094,19 @@ with st.sidebar:
                 st.write(f"**{k}**")
                 st.json(v)
     # Prev closes debug
-    if st.session_state.get("prev_closes"):
-        with st.expander("🔍 Prev Close Debug"):
-            pc = st.session_state.prev_closes
+    with st.expander("🔍 Prev Close Debug"):
+        pc = st.session_state.get("prev_closes", {})
+        if not pc:
+            st.write("Not fetched yet — prev_closes is empty")
+        else:
+            if "_errors" in pc:
+                st.error(f"Errors: {pc['_errors']}")
             for k, v in pc.items():
+                if k.startswith("_"):
+                    continue
                 if "_debug" not in k:
                     dbg = pc.get(k + "_debug", [])
-                    st.write(f"**{k}** → prev_close: {v}")
+                    st.write(f"**{k}** → `{v}`")
                     if dbg:
                         st.json(dbg)
 

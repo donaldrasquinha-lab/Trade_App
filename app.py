@@ -99,6 +99,7 @@ defaults = {
     "opt_candle_ts": None,
     "prev_closes":   {},    # prev day closing prices per instrument
     "prev_closes_ts": None,
+    "show_points":   False,  # True = show pts diff, False = show %
     "active_trade":  None,   # current saved trade
     "trade_log":     [],     # list of completed trades
     "trade_saved_at": None,  # datetime trade was saved
@@ -147,6 +148,19 @@ def is_high_volatility_window():
 # ==============================================================
 # 6. API: SPOT PRICES + VIX
 # ==============================================================
+
+def fmt_change(ltp, close_price, change_pct, show_pts):
+    """Returns (display_string, color) for change display."""
+    if show_pts:
+        pts = round(ltp - close_price, 2) if close_price else 0
+        sign = "+" if pts >= 0 else ""
+        col  = "#00c853" if pts >= 0 else "#f44336"
+        return f"{sign}{pts:.2f} pts", col
+    else:
+        sign = "+" if (change_pct or 0) >= 0 else ""
+        col  = "#00c853" if (change_pct or 0) >= 0 else "#f44336"
+        return f"{change_pct:+.2f}%" if change_pct is not None else "", col
+
 def fetch_prev_day_close(token, instrument_keys):
     """
     Fetches the previous trading day closing price for each key
@@ -996,6 +1010,12 @@ with st.sidebar:
     st.divider()
     st.caption("Market: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
+    st.divider()
+    _toggle_label = "Show % Change" if st.session_state.show_points else "Show Points Diff"
+    if st.button(_toggle_label):
+        st.session_state.show_points = not st.session_state.show_points
+        st.rerun()
+
 # ==============================================================
 # 14. FETCH SPOT PRICES
 # ==============================================================
@@ -1226,6 +1246,7 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             chg_sig = ("📉 Negative Day", "bear")
         else:
             chg_sig = ("➡️ Flat Day", "neutral")
+        # Show both % and pts in the outlook table
         metrics.append(("Intraday Move", f"{change_pct:+.2f}%", chg_sig[0], chg_sig[1]))
 
     # Signal score from technical indicators
@@ -1571,10 +1592,11 @@ with hc1:
 with hc2:
     # Spot price — most prominent element
     if spot:
-        _chg_col = "#00c853" if (change_pct and change_pct >= 0) else "#f44336"
-        _chg_str = f"{change_pct:+.2f}%" if change_pct else ""
-        _age_str = (f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago"
-                    if data_age is not None else "")
+        _close_px = feed_entry.get("close", spot) if feed_entry else spot
+        _chg_str, _chg_col = fmt_change(spot, _close_px, change_pct, st.session_state.show_points)
+        _age_str  = (f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago"
+                     if data_age is not None else "")
+        _mode_lbl = "pts" if st.session_state.show_points else "%"
         st.markdown(
             f'<div style="padding-top:2px;">'
             f'<div style="font-size:11px;color:#888;text-transform:uppercase;'
@@ -2372,18 +2394,23 @@ if chain:
 # ==============================================================
 if run_live and all_prices:
     st.markdown("### All Index Prices")
+    _col_label = "Change (pts)" if st.session_state.show_points else "Change %"
     rows = []
     for idx_name, idx_conf in INDEX_CONFIG.items():
         entry = all_prices.get(idx_conf["response_key"])
         if entry:
             dte_i, exp_i = get_dte(idx_conf["expiry_weekday"])
+            _ltp   = entry["ltp"]
+            _close = entry.get("close", _ltp)
+            _cpct  = entry.get("change_pct", 0)
+            _chg, _ = fmt_change(_ltp, _close, _cpct, st.session_state.show_points)
             rows.append({
-                "Index":    idx_name,
-                "LTP":      f"Rs.{entry['ltp']:,.2f}",
-                "Change %": f"{entry['change_pct']:+.2f}%",
-                "Expiry":   exp_i.strftime("%d %b"),
-                "DTE":      dte_i,
-                "Updated":  entry["ts"].strftime("%H:%M:%S"),
+                "Index":       idx_name,
+                "LTP":         f"Rs.{_ltp:,.2f}",
+                _col_label:    _chg,
+                "Expiry":      exp_i.strftime("%d %b"),
+                "DTE":         dte_i,
+                "Updated":     entry["ts"].strftime("%H:%M:%S"),
             })
     if rows:
         st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)

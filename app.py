@@ -305,14 +305,38 @@ def compute_indicators(df):
     }
 
 # ==============================================================
-# 10. SIGNAL ENGINE
-#     Scores each condition +1 (bullish) or -1 (bearish).
-#     Returns recommendation: BUY CE / BUY PE / WAIT / AVOID
+# 10. SIGNAL ENGINE  (Multi-factor: Technical + Macro)
+#
+#     LAYER 1 — Technical (max ±8 pts)
+#       EMA9 vs EMA21        ±1
+#       EMA crossover        ±2  (strong)
+#       Price vs VWAP        ±1
+#       Price vs EMA9        ±1
+#       RSI                  ±1
+#       MTF 15m alignment    ±1  (bonus if 15m agrees)
+#       MTF 30m alignment    ±1  (bonus if 30m agrees)
+#
+#     LAYER 2 — Macro/Market (max ±4 pts, fed into same score)
+#       India VIX            ±1  (direction bias + confidence cap)
+#       PCR                  ±1  (put-call ratio bias)
+#       Intraday change      ±1  (day trend confirmation)
+#       VIX extreme          confidence cap override
+#
+#     THRESHOLD — dynamic based on market conditions
+#       Normal:    score ≥ ±3 triggers recommendation
+#       High VIX:  score ≥ ±4 required (harder to trigger)
+#       Conflicted macro: score ≥ ±4 required
 # ==============================================================
-def generate_signal(ind, spot, vix, high_vol_window):
+def generate_signal(ind, spot, vix, high_vol_window,
+                    pcr=None, change_pct=None, ind_15=None, ind_30=None):
     """
-    Returns a signal dict with score, direction, confidence,
-    recommendation, target, stop-loss, and reason list.
+    Full multi-factor signal engine.
+    ind        : primary timeframe indicators dict
+    vix        : India VIX float
+    pcr        : put-call ratio float (PE OI / CE OI)
+    change_pct : intraday % change of index
+    ind_15     : 15m indicators dict (optional, for MTF)
+    ind_30     : 30m indicators dict (optional, for MTF)
     """
     if not ind or spot is None:
         return None
@@ -326,39 +350,43 @@ def generate_signal(ind, spot, vix, high_vol_window):
     vwap  = ind["vwap"]
     rsi   = ind["rsi"]
 
-    # ── Trend: EMA9 vs EMA21 ──────────────────
+    # ════════════════════════════════════════════
+    # LAYER 1: TECHNICAL INDICATORS
+    # ════════════════════════════════════════════
+
+    # ── 1. EMA9 vs EMA21 trend ────────────────
     if ema9 > ema21:
         score += 1
-        reasons.append(("bull", "EMA9 > EMA21 (uptrend)"))
+        reasons.append(("bull", f"EMA9 ({ema9:.0f}) > EMA21 ({ema21:.0f}) — uptrend"))
     else:
         score -= 1
-        reasons.append(("bear", "EMA9 < EMA21 (downtrend)"))
+        reasons.append(("bear", f"EMA9 ({ema9:.0f}) < EMA21 ({ema21:.0f}) — downtrend"))
 
-    # ── EMA crossover (last candle) ───────────
+    # ── 2. Fresh EMA crossover ────────────────
     if ind["ema9_prev"] <= ind["ema21_prev"] and ema9 > ema21:
         score += 2
-        reasons.append(("bull", "EMA9 just crossed ABOVE EMA21 (strong signal)"))
+        reasons.append(("bull", "EMA9 just crossed ABOVE EMA21 (golden cross)"))
     elif ind["ema9_prev"] >= ind["ema21_prev"] and ema9 < ema21:
         score -= 2
-        reasons.append(("bear", "EMA9 just crossed BELOW EMA21 (strong signal)"))
+        reasons.append(("bear", "EMA9 just crossed BELOW EMA21 (death cross)"))
 
-    # ── Price vs VWAP ─────────────────────────
+    # ── 3. Price vs VWAP ──────────────────────
     if close > vwap:
         score += 1
-        reasons.append(("bull", f"Price ({close:.0f}) above VWAP ({vwap:.0f})"))
+        reasons.append(("bull", f"Price ({close:.0f}) above VWAP ({vwap:.0f}) — buyers in control"))
     else:
         score -= 1
-        reasons.append(("bear", f"Price ({close:.0f}) below VWAP ({vwap:.0f})"))
+        reasons.append(("bear", f"Price ({close:.0f}) below VWAP ({vwap:.0f}) — sellers in control"))
 
-    # ── Price vs EMA9 (momentum) ──────────────
+    # ── 4. Price vs EMA9 momentum ─────────────
     if close > ema9:
         score += 1
-        reasons.append(("bull", f"Price above EMA9 ({ema9:.0f})"))
+        reasons.append(("bull", f"Price above EMA9 — positive momentum"))
     else:
         score -= 1
-        reasons.append(("bear", f"Price below EMA9 ({ema9:.0f})"))
+        reasons.append(("bear", f"Price below EMA9 — negative momentum"))
 
-    # ── RSI ───────────────────────────────────
+    # ── 5. RSI ────────────────────────────────
     if 55 <= rsi <= 75:
         score += 1
         reasons.append(("bull", f"RSI {rsi} in bullish zone (55–75)"))
@@ -367,37 +395,136 @@ def generate_signal(ind, spot, vix, high_vol_window):
         reasons.append(("bear", f"RSI {rsi} in bearish zone (25–45)"))
     elif rsi > 80:
         score -= 1
-        reasons.append(("warn", f"RSI {rsi} overbought — avoid CE"))
+        reasons.append(("warn", f"RSI {rsi} overbought — risk of reversal, avoid CE"))
     elif rsi < 20:
         score += 1
-        reasons.append(("warn", f"RSI {rsi} oversold — possible bounce"))
+        reasons.append(("warn", f"RSI {rsi} oversold — possible bounce, favour CE"))
 
-    # ── High volatility window bonus ─────────
-    if high_vol_window:
-        reasons.append(("info", "Inside high-volatility window (9:15–10:15 AM)"))
-    else:
-        score = int(score * 0.7)   # reduce confidence outside window
-        reasons.append(("warn", "Outside prime scalping window — reduce size"))
+    # ── 6. MTF 15m alignment ──────────────────
+    if ind_15:
+        mtf15_bull = (ind_15["ema9"] > ind_15["ema21"] and
+                      ind_15["close"] > ind_15["vwap"])
+        mtf15_bear = (ind_15["ema9"] < ind_15["ema21"] and
+                      ind_15["close"] < ind_15["vwap"])
+        if mtf15_bull:
+            score += 1
+            reasons.append(("bull", "15m chart aligned bullish (EMA & VWAP)"))
+        elif mtf15_bear:
+            score -= 1
+            reasons.append(("bear", "15m chart aligned bearish (EMA & VWAP)"))
+        else:
+            reasons.append(("info", "15m chart: mixed / neutral"))
 
-    # ── VIX check ─────────────────────────────
-    if vix:
-        if vix > 20:
-            reasons.append(("warn", f"VIX {vix:.1f} elevated — widen stop-loss"))
+    # ── 7. MTF 30m alignment ──────────────────
+    if ind_30:
+        mtf30_bull = (ind_30["ema9"] > ind_30["ema21"] and
+                      ind_30["close"] > ind_30["vwap"])
+        mtf30_bear = (ind_30["ema9"] < ind_30["ema21"] and
+                      ind_30["close"] < ind_30["vwap"])
+        if mtf30_bull:
+            score += 1
+            reasons.append(("bull", "30m chart aligned bullish (EMA & VWAP) — strong confirmation"))
+        elif mtf30_bear:
+            score -= 1
+            reasons.append(("bear", "30m chart aligned bearish (EMA & VWAP) — strong confirmation"))
+        else:
+            reasons.append(("info", "30m chart: mixed / neutral"))
+
+    # ════════════════════════════════════════════
+    # LAYER 2: MACRO / MARKET CONTEXT
+    # ════════════════════════════════════════════
+
+    vix_extreme   = False   # True = require higher threshold
+    macro_conflict = False  # True = technical & macro disagree
+
+    # ── 8. India VIX ──────────────────────────
+    if vix is not None:
+        if vix > 22:
+            score -= 1       # high fear biases toward PE
+            vix_extreme = True
+            reasons.append(("bear", f"VIX {vix:.1f} > 22 — high fear, bearish bias (-1), threshold raised"))
+        elif vix > 16:
+            reasons.append(("warn", f"VIX {vix:.1f} elevated — widen stop-loss by 50%"))
         elif vix < 12:
-            reasons.append(("warn", f"VIX {vix:.1f} very low — momentum may be weak"))
+            score -= 1       # low VIX = complacency, moves may be muted
+            reasons.append(("warn", f"VIX {vix:.1f} very low — weak momentum, signal penalised (-1)"))
+        else:
+            score += 1       # VIX 12–16 = ideal scalping conditions
+            reasons.append(("bull", f"VIX {vix:.1f} in ideal range (12–16) — good scalping conditions (+1)"))
 
-    # ── Direction & recommendation ────────────
+    # ── 9. Put-Call Ratio ─────────────────────
+    if pcr is not None:
+        tech_bull = score > 0    # is technical side currently bullish?
+        if pcr > 1.3:
+            score += 1
+            reasons.append(("bull", f"PCR {pcr:.2f} > 1.3 — heavy put writing, market makers bullish (+1)"))
+        elif pcr > 1.0:
+            score += 1
+            reasons.append(("bull", f"PCR {pcr:.2f} > 1.0 — mild put writing, slight bullish tilt (+1)"))
+        elif pcr < 0.7:
+            score -= 1
+            reasons.append(("bear", f"PCR {pcr:.2f} < 0.7 — low put writing, bearish sentiment (-1)"))
+            if tech_bull:
+                macro_conflict = True
+                reasons.append(("warn", "⚠️ Conflict: technicals bullish but PCR bearish — threshold raised"))
+        elif pcr < 0.85:
+            score -= 1
+            reasons.append(("bear", f"PCR {pcr:.2f} mildly bearish — more calls than puts (-1)"))
+        else:
+            reasons.append(("info", f"PCR {pcr:.2f} neutral (0.85–1.0)"))
+
+    # ── 10. Intraday change ───────────────────
+    if change_pct is not None:
+        if change_pct > 0.8:
+            score += 1
+            reasons.append(("bull", f"Intraday +{change_pct:.2f}% — strong positive day (+1)"))
+        elif change_pct > 0.3:
+            reasons.append(("bull", f"Intraday +{change_pct:.2f}% — mildly positive day"))
+        elif change_pct < -0.8:
+            score -= 1
+            reasons.append(("bear", f"Intraday {change_pct:.2f}% — strong negative day (-1)"))
+        elif change_pct < -0.3:
+            reasons.append(("bear", f"Intraday {change_pct:.2f}% — mildly negative day"))
+        else:
+            reasons.append(("info", f"Intraday {change_pct:+.2f}% — flat / sideways day"))
+
+    # ════════════════════════════════════════════
+    # TRADING WINDOW MODIFIER
+    # ════════════════════════════════════════════
+    if high_vol_window:
+        reasons.append(("info", "Inside high-volatility window (9:15–10:15 AM) — prime scalping time"))
+    else:
+        score = int(score * 0.7)
+        reasons.append(("warn", "Outside prime scalping window — score reduced 30%"))
+
+    # ════════════════════════════════════════════
+    # DYNAMIC THRESHOLD
+    # Normal market:   ±3 to trigger
+    # High VIX:        ±4 required  (volatile = need stronger signal)
+    # Macro conflict:  ±4 required  (technicals vs PCR disagreeing)
+    # Both:            ±5 required  (very high bar)
+    # ════════════════════════════════════════════
+    if vix_extreme and macro_conflict:
+        threshold = 5
+        reasons.append(("warn", "Threshold raised to ±5 (high VIX + macro conflict)"))
+    elif vix_extreme or macro_conflict:
+        threshold = 4
+        reasons.append(("warn", f"Threshold raised to ±4 ({'high VIX' if vix_extreme else 'macro conflict'})"))
+    else:
+        threshold = 3
+
     abs_score = abs(score)
 
-    if score >= 3:
+    # ── Final recommendation ──────────────────
+    if score >= threshold:
         direction      = "CE"
         recommendation = "BUY CE"
-        confidence     = "High" if abs_score >= 4 else "Medium"
+        confidence     = "High" if abs_score >= threshold + 1 else "Medium"
         emoji          = "🟢"
-    elif score <= -3:
+    elif score <= -threshold:
         direction      = "PE"
         recommendation = "BUY PE"
-        confidence     = "High" if abs_score >= 4 else "Medium"
+        confidence     = "High" if abs_score >= threshold + 1 else "Medium"
         emoji          = "🔴"
     elif abs_score <= 1:
         direction      = "NEUTRAL"
@@ -410,25 +537,33 @@ def generate_signal(ind, spot, vix, high_vol_window):
         confidence     = "Low"
         emoji          = "⚪"
 
-    # ── Target & stop-loss (10–20 pt scalp) ──
-    strike_move = 15   # mid-range of 10–20 pts
+    # ── Target & stop-loss ────────────────────
+    # Widen SL in high VIX conditions
+    strike_move = 15
+    sl_ratio    = 0.75 if (vix and vix > 16) else 0.5
     if direction == "CE":
         target    = round(close + strike_move, 0)
-        stop_loss = round(close - (strike_move * 0.5), 0)
+        stop_loss = round(close - (strike_move * sl_ratio), 0)
     elif direction == "PE":
         target    = round(close - strike_move, 0)
-        stop_loss = round(close + (strike_move * 0.5), 0)
+        stop_loss = round(close + (strike_move * sl_ratio), 0)
     else:
         target = stop_loss = None
 
+    rr = round(1 / sl_ratio, 1) if sl_ratio else 2.0
+
     return {
         "score":          score,
+        "threshold":      threshold,
         "direction":      direction,
         "recommendation": recommendation,
         "confidence":     confidence,
         "emoji":          emoji,
         "target":         target,
         "stop_loss":      stop_loss,
+        "rr":             rr,
+        "vix_extreme":    vix_extreme,
+        "macro_conflict": macro_conflict,
         "reasons":        reasons,
     }
 
@@ -771,7 +906,13 @@ def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
 # ==============================================================
 # 17. GENERATE SIGNAL
 # ==============================================================
-signal = generate_signal(indicators, spot, st.session_state.last_vix, _high_vol)
+signal = generate_signal(
+    indicators, spot, st.session_state.last_vix, _high_vol,
+    pcr=st.session_state.pcr,
+    change_pct=change_pct,
+    ind_15=ind_15,
+    ind_30=ind_30,
+)
 
 # ==============================================================
 # 18. PAGE HEADER + MARKET OUTLOOK

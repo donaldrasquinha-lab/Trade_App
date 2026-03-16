@@ -1470,48 +1470,52 @@ elif run_live and not indicators:
 # ==============================================================
 # 20. RECOMMENDED CE / PE PANELS  (directly below signal card)
 # ==============================================================
-def render_snr_bar(snr, ltp, label_col, bg_col):
-    """Render a compact S/R level bar for an option premium."""
-    supports    = snr.get("support", [])
-    resistances = snr.get("resistance", [])
 
-    def level_pill(price, kind):
-        color = "#00c853" if kind == "S" else "#f44336"
-        bg    = "#0d3320"  if kind == "S" else "#3d0a0a"
-        dist  = round(price - ltp, 2) if ltp else 0
-        sign  = "+" if dist >= 0 else ""
-        return (
-            f'<span style="background:{bg};color:{color};border:1px solid {color};'
-            f'border-radius:4px;padding:2px 8px;font-size:12px;font-weight:600;'
-            f'margin:0 3px;white-space:nowrap;">'
-            f'{kind} {price:.1f} <span style="opacity:0.7;font-size:10px;">({sign}{dist:.1f})</span>'
-            f'</span>'
-        )
+def build_snr_html(snr, ltp, label_col, tf_label):
+    """Build S/R pills HTML string. Always returns something visible."""
+    if not ltp or ltp <= 0:
+        return ""
 
-    # Fallback: if scaling produced nothing, synthesise ±5/10/15% levels
+    supports    = list(snr.get("support", []))
+    resistances = list(snr.get("resistance", []))
+
+    # Guaranteed fallback — always show levels
     if not supports:
-        supports = [round(ltp * f, 1) for f in [0.97, 0.94, 0.91]]
+        supports = [round(ltp * 0.97, 1), round(ltp * 0.94, 1), round(ltp * 0.91, 1)]
     if not resistances:
-        resistances = [round(ltp * f, 1) for f in [1.03, 1.06, 1.09]]
+        resistances = [round(ltp * 1.03, 1), round(ltp * 1.06, 1), round(ltp * 1.09, 1)]
 
-    pills = ""
+    def pill(price, kind):
+        color = "#00c853" if kind == "S" else "#f44336"
+        bg    = "#0d3320" if kind == "S" else "#3d0a0a"
+        dist  = round(price - ltp, 1)
+        sign  = "+" if dist >= 0 else ""
+        return (f'<span style="display:inline-block;background:{bg};color:{color};'
+                f'border:1px solid {color};border-radius:4px;padding:3px 8px;'
+                f'font-size:12px;font-weight:600;margin:2px;">'
+                f'{kind} {price:.1f}'
+                f'<span style="font-size:10px;opacity:0.8;margin-left:3px;">({sign}{dist:.1f})</span>'
+                f'</span>')
+
+    ltp_pill = (f'<span style="display:inline-block;background:#0d0d2e;color:{label_col};'
+                f'border:2px solid {label_col};border-radius:4px;padding:3px 10px;'
+                f'font-size:12px;font-weight:700;margin:2px;">LTP {ltp:.1f}</span>')
+
+    html = (f'<div style="margin:8px 0;padding:8px;background:rgba(255,255,255,0.03);'
+            f'border-radius:6px;border-left:3px solid {label_col};">'
+            f'<div style="font-size:11px;color:#888;margin-bottom:6px;'
+            f'text-transform:uppercase;letter-spacing:0.08em;">'
+            f'S/R Levels ({tf_label})</div>'
+            f'<div style="display:flex;flex-wrap:wrap;align-items:center;gap:2px;">')
+
     for p in sorted(supports, reverse=True)[:3]:
-        pills += level_pill(p, "S")
-    pills += (
-        f'<span style="background:#1a1a2e;color:{label_col};border:1.5px solid {label_col};'
-        f'border-radius:4px;padding:2px 8px;font-size:12px;font-weight:700;margin:0 4px;">'
-        f'LTP {ltp:.1f}</span>'
-    )
+        html += pill(p, "S")
+    html += ltp_pill
     for p in sorted(resistances)[:3]:
-        pills += level_pill(p, "R")
+        html += pill(p, "R")
 
-    st.markdown(
-        f'<div style="margin:6px 0 10px;line-height:2.2;">'
-        f'<span style="font-size:11px;color:#888;text-transform:uppercase;'
-        f'letter-spacing:0.08em;margin-right:6px;">S/R ({candle_interval}m)</span>'
-        f'{pills}</div>',
-        unsafe_allow_html=True
-    )
+    html += "</div></div>"
+    return html
 
 if spot and atm and g_ce and g_pe:
     col_ce, col_pe = st.columns(2)
@@ -1523,9 +1527,9 @@ if spot and atm and g_ce and g_pe:
         p1.metric("Premium",      f"Rs.{ce_ltp:,.2f}" if ce_ltp else "--")
         p2.metric("Buyer Margin", fmt_inr(ce_ltp * conf["lot_size"] * lots) if ce_ltp else "--")
         p3.metric("OI",           f"{ce_data.get('ce_oi', 0):,}" if ce_data else "--")
-        # S/R levels for CE premium
         if ce_ltp:
-            render_snr_bar(ce_snr, ce_ltp, "#00e676", "#0d3320")
+            ce_html = build_snr_html(ce_snr, ce_ltp, "#00e676", candle_interval + "m")
+            st.markdown(ce_html, unsafe_allow_html=True)
         st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_ce["delta"], sign_str(g_ce["delta"]))
@@ -1543,9 +1547,9 @@ if spot and atm and g_ce and g_pe:
         p1.metric("Premium",      f"Rs.{pe_ltp:,.2f}" if pe_ltp else "--")
         p2.metric("Buyer Margin", fmt_inr(pe_ltp * conf["lot_size"] * lots) if pe_ltp else "--")
         p3.metric("OI",           f"{pe_data.get('pe_oi', 0):,}" if pe_data else "--")
-        # S/R levels for PE premium
         if pe_ltp:
-            render_snr_bar(pe_snr, pe_ltp, "#ff5252", "#3d0a0a")
+            pe_html = build_snr_html(pe_snr, pe_ltp, "#ff5252", candle_interval + "m")
+            st.markdown(pe_html, unsafe_allow_html=True)
         st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_pe["delta"], sign_str(g_pe["delta"]))

@@ -68,13 +68,12 @@ ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 
 # ==============================================================
 # 4. MODULE-LEVEL SHARED STATE
-#
-#    Uses single-element lists for mutable state so background
-#    threads can update values without needing `global` keyword
-#    and without touching st.session_state.
+#    Single-element lists so daemon threads can mutate values
+#    without `global` declarations and without touching
+#    st.session_state (which is not accessible from threads).
 # ==============================================================
-_price_feed = {}         # instrument_key -> {ltp, close, change_pct, ts}
-_ws_status  = ["disconnected"]  # one of: connecting / live / error:<msg> / disconnected
+_price_feed = {}               # ikey -> {ltp, close, change_pct, ts}
+_ws_status  = ["disconnected"] # connecting | live | error:<msg> | disconnected
 _ws_started = [False]
 
 # ==============================================================
@@ -83,20 +82,34 @@ _ws_started = [False]
 if "do_reconnect" not in st.session_state:
     st.session_state.do_reconnect = False
 
-# ==============================================================
-# 6. WEBSOCKET FEED  -- MarketDataStreamerV3
-#
-#    Key facts from official SDK docs:
-#      - Constructor takes ApiClient only (no keys/mode in constructor)
-#      - streamer.subscribe(keys, mode) is called inside on_open()
-#      - Callbacks take NO arguments (not ws, message -- just message)
-#      - streamer.auto_reconnect(True, interval_sec, retries) is optional
-# ==============================================================
+if "token_ok" not in st.session_state:
+    st.session_state.token_ok = None   # None = unchecked, True = ok, False = bad
 
+# ==============================================================
+# 6. TOKEN VALIDATION
+#    Runs once per session to verify the token before connecting.
+# ==============================================================
+def validate_token(token):
+    """
+    Calls the WS authorize endpoint to confirm the token is valid.
+    Returns (True, url) or (False, error_message).
+    """
+    try:
+        conf = upstox_client.Configuration()
+        conf.access_token = token
+        api  = upstox_client.WebsocketApi(upstox_client.ApiClient(conf))
+        res  = api.get_market_data_feed_authorize_v3("2.0")
+        return True, res.data.authorized_redirect_uri
+    except Exception as e:
+        return False, str(e)
+
+# ==============================================================
+# 7. WEBSOCKET FEED  -- MarketDataStreamerV3
+# ==============================================================
 def _stream_market_data(token, instrument_keys):
     """
     Runs in a daemon thread.
-    Only writes to module-level _price_feed, _ws_status, _ws_started.
+    Writes only to module-level _price_feed, _ws_status, _ws_started.
     Never touches st.session_state.
     """
     _ws_status[0] = "connecting"
@@ -105,14 +118,10 @@ def _stream_market_data(token, instrument_keys):
     configuration.access_token = token
     api_client = upstox_client.ApiClient(configuration)
 
-    # Constructor takes ApiClient only -- keys/mode go in on_open
     streamer = upstox_client.MarketDataStreamerV3(api_client)
-
-    # Auto-reconnect: enabled, 5 second interval, 3 retries
     streamer.auto_reconnect(True, 5, 3)
 
     def on_open():
-        # Subscribe must be called after connection is established
         streamer.subscribe(instrument_keys, "ltpc")
         _ws_status[0] = "live"
 
@@ -143,7 +152,7 @@ def _stream_market_data(token, instrument_keys):
         _ws_started[0] = False
 
     def on_reconnect_stopped(message):
-        _ws_status[0] = f"error:Auto-reconnect stopped -- {message}"
+        _ws_status[0] = f"error:Reconnect stopped -- {message}"
         _ws_started[0] = False
 
     streamer.on("open",                on_open)
@@ -153,7 +162,7 @@ def _stream_market_data(token, instrument_keys):
     streamer.on("autoReconnectStopped", on_reconnect_stopped)
 
     try:
-        streamer.connect()   # blocking
+        streamer.connect()
     except Exception as e:
         _ws_status[0] = f"error:{e}"
         _ws_started[0] = False
@@ -172,14 +181,13 @@ def start_feed():
     ).start()
 
 # ==============================================================
-# 7. GREEKS ENGINE
+# 8. GREEKS ENGINE
 # ==============================================================
-
 def greeks(S, K, T, r, sigma, option_type):
     if T <= 0 or sigma <= 0 or S <= 0:
         return dict(delta=0.0, gamma=0.0, vega=0.0, theta=0.0, rho=0.0)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    d1   = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2   = d1 - sigma * np.sqrt(T)
     pdf1 = norm.pdf(d1)
     if option_type == "call":
         delta = norm.cdf(d1)
@@ -194,27 +202,26 @@ def greeks(S, K, T, r, sigma, option_type):
     gamma = pdf1 / (S * sigma * np.sqrt(T))
     vega  = S * pdf1 * np.sqrt(T) / 100
     return dict(
-        delta = round(delta,         4),
-        gamma = round(gamma,         6),
-        vega  = round(vega,          2),
-        theta = round(theta / 365,   2),
-        rho   = round(rho,           4),
+        delta = round(delta,       4),
+        gamma = round(gamma,       6),
+        vega  = round(vega,        2),
+        theta = round(theta / 365, 2),
+        rho   = round(rho,         4),
     )
 
 # ==============================================================
-# 8. HELPERS
+# 9. HELPERS
 # ==============================================================
-
 def fmt_inr(v):
-    if v >= 1e7:  return f"Rs.{v/1e7:.2f} Cr"
-    if v >= 1e5:  return f"Rs.{v/1e5:.2f} L"
+    if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
+    if v >= 1e5: return f"Rs.{v/1e5:.2f} L"
     return f"Rs.{v:,.0f}"
 
 def sign_str(v):
     return f"+{v}" if v >= 0 else str(v)
 
 # ==============================================================
-# 9. SIDEBAR
+# 10. SIDEBAR
 # ==============================================================
 with st.sidebar:
     st.markdown("## Scalper Controls")
@@ -248,6 +255,25 @@ with st.sidebar:
     )
 
     st.divider()
+    st.markdown("### Connection Status")
+
+    # Token check button
+    if st.button("Check Token"):
+        with st.spinner("Validating token..."):
+            ok, msg = validate_token(TOKEN)
+            st.session_state.token_ok = ok
+            st.session_state.token_msg = msg
+
+    if st.session_state.token_ok is True:
+        st.success("Token valid")
+    elif st.session_state.token_ok is False:
+        st.error(f"Token invalid: {st.session_state.get('token_msg', '')}")
+    else:
+        st.caption("Press Check Token to validate")
+
+    st.divider()
+
+    # WebSocket status
     status = _ws_status[0]
     if status == "live":
         st.success("WebSocket: Live")
@@ -258,14 +284,20 @@ with st.sidebar:
     else:
         st.caption("WebSocket: Not started")
 
-    # Reconnect button -- sets a session flag, handled below at module level
+    # Reconnect button
     if not _ws_started[0] and status not in ("connecting",):
         if st.button("Reconnect"):
             st.session_state.do_reconnect = True
             st.rerun()
 
+    # Market hours reminder
+    st.divider()
+    now_ist = datetime.utcnow().replace(tzinfo=None)
+    st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
+    st.caption("No ticks outside market hours.")
+
 # ==============================================================
-# 10. HANDLE RECONNECT  (module level -- safe to write globals here)
+# 11. HANDLE RECONNECT
 # ==============================================================
 if st.session_state.do_reconnect:
     _ws_started[0] = False
@@ -274,13 +306,13 @@ if st.session_state.do_reconnect:
     st.session_state.do_reconnect = False
 
 # ==============================================================
-# 11. START FEED
+# 12. START FEED
 # ==============================================================
 if run_live and not _ws_started[0]:
     start_feed()
 
 # ==============================================================
-# 12. READ LATEST PRICE
+# 13. READ LATEST PRICE
 # ==============================================================
 ikey       = conf["instrument_key"]
 feed_entry = _price_feed.get(ikey) if run_live else None
@@ -293,7 +325,7 @@ else:
     spot = change_pct = data_age = None
 
 # ==============================================================
-# 13. PAGE HEADER
+# 14. PAGE HEADER
 # ==============================================================
 st.markdown(f"# {selected_index} Scalper")
 
@@ -302,20 +334,24 @@ with h1:
     s = _ws_status[0]
     if run_live and s == "live":
         st.caption("🟢 WebSocket V3 live")
-    elif run_live:
-        st.caption(f"🟡 {s}...")
+    elif run_live and s == "connecting":
+        st.caption("🟡 Connecting...")
+    elif run_live and s.startswith("error:"):
+        st.caption(f"🔴 {s[6:]}")
     else:
-        st.caption("⚪ Paused")
+        st.caption("⚪ Paused -- toggle Live Feed to start")
 with h2:
     if data_age is not None:
         st.caption(f"Last tick: {'< 1s' if data_age < 1 else f'{data_age:.1f}s'} ago")
+    elif run_live and s == "live":
+        st.caption("Waiting for first tick...")
 with h3:
     st.caption(f"Instrument: `{ikey}`")
 
 st.divider()
 
 # ==============================================================
-# 14. TOP METRICS
+# 15. TOP METRICS
 # ==============================================================
 step = conf["strike_step"]
 
@@ -341,7 +377,7 @@ m4.metric("DTE", f"{dte_days}d", f"IV {iv_pct}%")
 st.divider()
 
 # ==============================================================
-# 15. GREEKS PANELS
+# 16. GREEKS PANELS
 # ==============================================================
 if spot and atm:
     g_ce = greeks(spot, ce_strike, dte, r, iv, "call")
@@ -399,10 +435,10 @@ if spot and atm:
             gp  = greeks(spot, pe_strike, rem, r, iv, "put")
             combined = round((gc["theta"] + gp["theta"]) * lots * conf["lot_size"], 2)
             rows.append({
-                "Day":                   f"Day +{day}",
-                "DTE Remaining":         dte_days - day,
-                "CE Theta":              gc["theta"],
-                "PE Theta":              gp["theta"],
+                "Day":                    f"Day +{day}",
+                "DTE Remaining":          dte_days - day,
+                "CE Theta":               gc["theta"],
+                "PE Theta":               gp["theta"],
                 f"Net P&L Rs. x {lots}L": combined,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -410,10 +446,21 @@ if spot and atm:
         st.info("Set DTE > 0 to see the theta decay table.")
 
 else:
-    st.info("Enable Live Feed in the sidebar to start streaming.")
+    # Show a helpful message depending on state
+    s = _ws_status[0]
+    if not run_live:
+        st.info("Toggle **Start Live Feed** in the sidebar to begin.")
+    elif s == "connecting":
+        st.info("Connecting to Upstox WebSocket...")
+    elif s == "live":
+        st.info("Connected. Waiting for first tick. Market must be open (9:15 AM - 3:30 PM IST).")
+    elif s.startswith("error:"):
+        st.error(f"Feed error: {s[6:]}. Check your token and press Reconnect in the sidebar.")
+    else:
+        st.info("Feed not started. Toggle **Start Live Feed** in the sidebar.")
 
 # ==============================================================
-# 16. ALL-INDEX OVERVIEW
+# 17. ALL-INDEX OVERVIEW
 # ==============================================================
 if run_live and _price_feed:
     st.divider()
@@ -435,7 +482,7 @@ if run_live and _price_feed:
         st.caption("Waiting for first tick...")
 
 # ==============================================================
-# 17. AUTO-REFRESH
+# 18. AUTO-REFRESH
 # ==============================================================
 if run_live:
     time.sleep(refresh_ms / 1000)

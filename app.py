@@ -1478,14 +1478,18 @@ with title_col:
     else:
         adx_badge = '<span style="color:#888;font-size:13px;padding:4px 8px;">ADX: computing...</span>'
 
+    # Spot badge shown inline next to sentiment
+    if spot:
+        _chg_col   = "#00c853" if (change_pct and change_pct >= 0) else "#f44336"
+        _chg_str   = f"{change_pct:+.2f}%" if change_pct else ""
+        _spot_badge = (
+            f'<span style="font-size:22px;font-weight:600;color:white;margin:0 4px;">'            f'Rs.{spot:,.2f}'            f'<span style="font-size:13px;color:{_chg_col};margin-left:5px;">{_chg_str}</span>'            f'</span>'
+        )
+    else:
+        _spot_badge = '<span style="font-size:18px;color:#888;margin:0 6px;">—</span>'
+
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
-        f'<span style="font-size:28px;font-weight:700;">{selected_index} Scalper</span>'
-        f'<span style="background:{_outlook["bg"]};color:{col};border:1.5px solid {col};'
-        f'border-radius:6px;padding:4px 14px;font-size:15px;font-weight:700;letter-spacing:0.05em;">'
-        f'{_outlook["emoji"]} {sent}</span>'
-        f'{adx_badge}'
-        f'</div>',
+        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'        f'<span style="font-size:26px;font-weight:700;">{selected_index} Scalper</span>'        f'<span style="background:{_outlook["bg"]};color:{col};border:1.5px solid {col};'        f'border-radius:6px;padding:4px 14px;font-size:15px;font-weight:700;">'        f'{_outlook["emoji"]} {sent}</span>'        f'{_spot_badge}'        f'{adx_badge}'        f'</div>',
         unsafe_allow_html=True
     )
 with sent_col:
@@ -1498,17 +1502,18 @@ with sent_col:
 
 
 # ── Status bar ────────────────────────────────────────────────
-h1, h2, h3 = st.columns(3)
+h1, h2 = st.columns(2)
 with h1:
+    _sb = []
     if data_age is not None:
-        st.caption(f"Spot updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
-with h2:
+        _sb.append(f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
     if st.session_state.last_vix:
-        vix_val = st.session_state.last_vix
-        vix_str = f"VIX: {vix_val:.2f}%" if vix_val else "VIX: --"
-        st.caption(vix_str)
-with h3:
-    st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
+        _sb.append(f"VIX: {st.session_state.last_vix:.2f}%")
+    if _sb:
+        st.caption("  |  ".join(_sb))
+with h2:
+    _atm_str = f"  |  ATM: {atm:,}" if atm else ""
+    st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d){_atm_str}")
 
 st.divider()
 
@@ -2034,18 +2039,6 @@ if spot and atm:
 
 # ==============================================================
 
-# 21. TOP METRICS
-# ==============================================================
-if spot and atm:
-    exposure = spot * lots * conf["lot_size"]
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(f"{selected_index} Spot",
-              f"Rs.{spot:,.2f}", f"{change_pct:+.2f}%" if change_pct else None)
-    m2.metric("ATM Strike",      f"{atm:,}")
-    m3.metric("Notional Exposure", fmt_inr(exposure),
-              f"{lots} lot x {conf['lot_size']}")
-    m4.metric("DTE", f"{dte_days}d", expiry_date.strftime("%d %b %Y"))
-    st.divider()
 
 # ==============================================================
 # 23. MULTI-TIMEFRAME INDICATOR PANEL

@@ -1,12 +1,7 @@
 """
 Multi-Index Live Scalper Dashboard
-Upstox REST Market Quote API -- works on Streamlit Cloud
----------------------------------------------------------
-Auto features:
-  - IV pulled live from India VIX
-  - DTE calculated from current date to weekly expiry
-  - Refresh rate adapts to market session (fast open/close, slow midday)
-
+With Signal Engine: VWAP, EMA9/21, Momentum, Trade Recommendation
+------------------------------------------------------------------
 SETUP:
   1. pip install -r requirements.txt
   2. Create .streamlit/secrets.toml:
@@ -51,146 +46,404 @@ INDEX_CONFIG = {
         "response_key":   "NSE_INDEX:Nifty 50",
         "lot_size":       75,
         "strike_step":    50,
-        "expiry_weekday": 3,    # Thursday
+        "expiry_weekday": 3,
     },
     "BANK NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Bank",
         "response_key":   "NSE_INDEX:Nifty Bank",
         "lot_size":       30,
         "strike_step":    100,
-        "expiry_weekday": 2,    # Wednesday
+        "expiry_weekday": 2,
     },
     "FINNIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Fin Service",
         "response_key":   "NSE_INDEX:Nifty Fin Service",
         "lot_size":       65,
         "strike_step":    50,
-        "expiry_weekday": 2,    # Tuesday (index 1) -- adjust if needed
+        "expiry_weekday": 1,
     },
     "MIDCAP NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Midcap Select",
         "response_key":   "NSE_INDEX:Nifty Midcap Select",
         "lot_size":       120,
         "strike_step":    25,
-        "expiry_weekday": 0,    # Monday
+        "expiry_weekday": 0,
     },
 }
 
 ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
-
-# India VIX -- fetched alongside index prices
-VIX_INSTRUMENT_KEY = "NSE_INDEX|India VIX"
-VIX_RESPONSE_KEY   = "NSE_INDEX:India VIX"
+VIX_INSTRUMENT_KEY  = "NSE_INDEX|India VIX"
+VIX_RESPONSE_KEY    = "NSE_INDEX:India VIX"
 
 # ==============================================================
-# 4. SESSION STATE INIT
+# 4. SESSION STATE
 # ==============================================================
-if "token_ok"    not in st.session_state: st.session_state.token_ok    = None
-if "token_msg"   not in st.session_state: st.session_state.token_msg   = ""
-if "live_feed"   not in st.session_state: st.session_state.live_feed   = False
-if "last_prices" not in st.session_state: st.session_state.last_prices = {}
-if "last_vix"    not in st.session_state: st.session_state.last_vix    = None
+defaults = {
+    "token_ok":    None,
+    "token_msg":   "",
+    "live_feed":   False,
+    "last_prices": {},
+    "last_vix":    None,
+    "last_chain":  {},
+    "chain_ts":    None,
+    "candle_ts":   None,
+    "candle_df":   None,   # pd.DataFrame of 1m candles
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ==============================================================
-# 5. AUTO DTE
+# 5. HELPERS
 # ==============================================================
 def get_dte(expiry_weekday):
-    """
-    Returns (dte_days, expiry_date) for the next weekly expiry.
-    Rolls to the following week if today IS the expiry day and
-    market has closed (after 15:30 IST).
-    """
-    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    today   = now_ist.date()
-
+    now_ist    = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today      = now_ist.date()
     days_ahead = expiry_weekday - today.weekday()
     if days_ahead < 0:
         days_ahead += 7
-    elif days_ahead == 0:
-        # Today is expiry -- roll after 15:30 IST
-        if now_ist.hour >= 15 and now_ist.minute >= 30:
-            days_ahead = 7
-
+    elif days_ahead == 0 and now_ist.hour >= 15 and now_ist.minute >= 30:
+        days_ahead = 7
     expiry_date = today + timedelta(days=days_ahead)
-    dte_days    = (expiry_date - today).days
-    return dte_days, expiry_date
+    return (expiry_date - today).days, expiry_date
 
-
-# ==============================================================
-# 6. AUTO REFRESH RATE
-# ==============================================================
 def get_refresh_ms():
-    """
-    Fast (1s) near open/close, normal (2s) midday, slow (3s) pre-market.
-    Based on IST time.
-    """
     now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    h, m    = now_ist.hour, now_ist.minute
-    t       = h * 60 + m    # minutes since midnight IST
-
-    if 555 <= t <= 570:     # 9:15 - 9:30 IST  (opening volatility)
+    t = now_ist.hour * 60 + now_ist.minute
+    if 555 <= t <= 570 or 870 <= t <= 930:
         return 1000
-    elif 870 <= t <= 930:   # 14:30 - 15:30 IST (closing volatility)
-        return 1000
-    elif 555 <= t <= 930:   # market hours midday
+    elif 555 <= t <= 930:
         return 2000
-    else:
-        return 3000         # outside market hours
+    return 3000
 
+def fmt_inr(v):
+    if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
+    if v >= 1e5: return f"Rs.{v/1e5:.2f} L"
+    return f"Rs.{v:,.0f}"
+
+def sign_str(v):
+    return f"+{v}" if v >= 0 else str(v)
+
+def is_high_volatility_window():
+    """Returns True during 9:15-10:15 AM and 2:45-3:30 PM IST."""
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    t = now_ist.hour * 60 + now_ist.minute
+    return (555 <= t <= 615) or (885 <= t <= 930)
 
 # ==============================================================
-# 7. PRICE FETCH  (index prices + VIX in one call)
+# 6. API: SPOT PRICES + VIX
 # ==============================================================
 def fetch_all_prices(token):
     try:
         conf = upstox_client.Configuration()
         conf.access_token = token
         api  = upstox_client.MarketQuoteApi(upstox_client.ApiClient(conf))
-
-        # Fetch all indices + VIX in a single API call
-        all_keys = ALL_INSTRUMENT_KEYS + [VIX_INSTRUMENT_KEY]
-        keys_str = ",".join(all_keys)
+        keys_str = ",".join(ALL_INSTRUMENT_KEYS + [VIX_INSTRUMENT_KEY])
         res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
-
         prices = {}
         vix    = None
-
         if res.status == "success" and res.data:
-            for response_key, quote in res.data.items():
-                if isinstance(quote, dict):
-                    ltp   = quote.get("last_price")
-                    ohlc  = quote.get("ohlc", {})
-                    close = ohlc.get("close") if isinstance(ohlc, dict) else None
-                else:
-                    ltp   = getattr(quote, "last_price", None)
-                    ohlc  = getattr(quote, "ohlc", None)
-                    close = (ohlc.get("close") if isinstance(ohlc, dict)
-                             else getattr(ohlc, "close", None))
-
+            for rkey, quote in res.data.items():
+                q     = quote if isinstance(quote, dict) else (quote.to_dict() if hasattr(quote, "to_dict") else {})
+                ltp   = q.get("last_price") or getattr(quote, "last_price", None)
+                ohlc  = q.get("ohlc", {}) or {}
+                close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
                 if ltp is None:
                     continue
-
-                ltp        = float(ltp)
-                close      = float(close) if close else ltp
-                change_pct = round(((ltp - close) / close) * 100, 2) if close else 0.0
-
+                ltp   = float(ltp)
+                close = float(close) if close else ltp
                 entry = {
                     "ltp":        ltp,
                     "close":      close,
-                    "change_pct": change_pct,
+                    "change_pct": round(((ltp - close) / close) * 100, 2) if close else 0.0,
                     "ts":         datetime.now(),
                 }
-
-                if response_key == VIX_RESPONSE_KEY:
-                    vix = ltp    # VIX is quoted as a percentage e.g. 13.5
+                if rkey == VIX_RESPONSE_KEY:
+                    vix = ltp
                 else:
-                    prices[response_key] = entry
-
+                    prices[rkey] = entry
         return prices, vix, None
-
     except Exception as e:
         return {}, None, str(e)
 
+# ==============================================================
+# 7. API: INTRADAY CANDLES (1-minute, V3)
+#    Candle format: [timestamp, open, high, low, close, volume, oi]
+#    Fetched every 60s -- one full candle per minute.
+# ==============================================================
+def fetch_candles(token, instrument_key, interval_min=1):
+    try:
+        conf = upstox_client.Configuration()
+        conf.access_token = token
+        api  = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
+        res  = api.get_intra_day_candle_data(instrument_key, "minutes", str(interval_min))
+
+        if res.status != "success" or not res.data or not res.data.candles:
+            return None, "No candle data"
+
+        rows = []
+        for c in res.data.candles:
+            rows.append({
+                "ts":     pd.to_datetime(c[0]),
+                "open":   float(c[1]),
+                "high":   float(c[2]),
+                "low":    float(c[3]),
+                "close":  float(c[4]),
+                "volume": float(c[5]),
+            })
+
+        df = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
+        return df, None
+
+    except Exception as e:
+        return None, str(e)
+
+# ==============================================================
+# 8. API: OPTION CHAIN
+# ==============================================================
+def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
+    try:
+        conf = upstox_client.Configuration()
+        conf.access_token = token
+        api  = upstox_client.OptionsApi(upstox_client.ApiClient(conf))
+        res  = api.get_put_call_option_chain(instrument_key, expiry_date_str)
+        chain  = {}
+        wanted = set(atm + i * step for i in range(-n, n + 1))
+        if res.status == "success" and res.data:
+            for item in res.data:
+                strike = (item.strike_price if hasattr(item, "strike_price")
+                          else item.get("strike_price") if isinstance(item, dict) else None)
+                if not strike or strike not in wanted:
+                    continue
+
+                def ex(opt):
+                    if opt is None: return {}
+                    if isinstance(opt, dict):
+                        md = opt.get("market_data", {}) or {}
+                        og = opt.get("option_greeks", {}) or {}
+                    else:
+                        md = getattr(opt, "market_data", None) or {}
+                        og = getattr(opt, "option_greeks", None) or {}
+                        if hasattr(md, "to_dict"): md = md.to_dict()
+                        if hasattr(og, "to_dict"): og = og.to_dict()
+                    return {
+                        "ltp":   float(md.get("ltp", 0) or 0),
+                        "oi":    int(md.get("oi",  0) or 0),
+                        "iv":    float(og.get("iv",    0) or 0),
+                        "delta": float(og.get("delta", 0) or 0),
+                        "theta": float(og.get("theta", 0) or 0),
+                        "gamma": float(og.get("gamma", 0) or 0),
+                        "vega":  float(og.get("vega",  0) or 0),
+                    }
+
+                ce = ex(item.call_options if hasattr(item, "call_options") else item.get("call_options"))
+                pe = ex(item.put_options  if hasattr(item, "put_options")  else item.get("put_options"))
+                chain[int(strike)] = {
+                    "ce_ltp": ce.get("ltp", 0), "pe_ltp": pe.get("ltp", 0),
+                    "ce_iv":  ce.get("iv",  0), "pe_iv":  pe.get("iv",  0),
+                    "ce_delta":ce.get("delta",0),"pe_delta":pe.get("delta",0),
+                    "ce_theta":ce.get("theta",0),"pe_theta":pe.get("theta",0),
+                    "ce_gamma":ce.get("gamma",0),"pe_gamma":pe.get("gamma",0),
+                    "ce_vega": ce.get("vega", 0),"pe_vega": pe.get("vega",0),
+                    "ce_oi":  ce.get("oi",   0), "pe_oi":  pe.get("oi",  0),
+                }
+        return chain, None
+    except Exception as e:
+        return {}, str(e)
+
+# ==============================================================
+# 9. INDICATORS
+# ==============================================================
+def compute_indicators(df):
+    """
+    Computes EMA9, EMA21, VWAP, RSI14 on a candle DataFrame.
+    Returns the updated df + latest values dict.
+    """
+    if df is None or len(df) < 5:
+        return df, {}
+
+    df = df.copy()
+
+    # EMA
+    df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    # VWAP = cumulative(typical_price * volume) / cumulative(volume)
+    df["tp"]   = (df["high"] + df["low"] + df["close"]) / 3
+    df["tpv"]  = df["tp"] * df["volume"]
+    df["vwap"] = df["tpv"].cumsum() / df["volume"].cumsum()
+
+    # RSI 14
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=13, adjust=False).mean()
+    avg_l = loss.ewm(com=13, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # Latest values
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+
+    return df, {
+        "close":    last["close"],
+        "ema9":     round(last["ema9"], 2),
+        "ema21":    round(last["ema21"], 2),
+        "vwap":     round(last["vwap"], 2),
+        "rsi":      round(last["rsi"], 1),
+        "volume":   int(last["volume"]),
+        "ema9_prev":  round(prev["ema9"], 2),
+        "ema21_prev": round(prev["ema21"], 2),
+        "prev_close": prev["close"],
+    }
+
+# ==============================================================
+# 10. SIGNAL ENGINE
+#     Scores each condition +1 (bullish) or -1 (bearish).
+#     Returns recommendation: BUY CE / BUY PE / WAIT / AVOID
+# ==============================================================
+def generate_signal(ind, spot, vix, high_vol_window):
+    """
+    Returns a signal dict with score, direction, confidence,
+    recommendation, target, stop-loss, and reason list.
+    """
+    if not ind or spot is None:
+        return None
+
+    score   = 0
+    reasons = []
+
+    close = ind["close"]
+    ema9  = ind["ema9"]
+    ema21 = ind["ema21"]
+    vwap  = ind["vwap"]
+    rsi   = ind["rsi"]
+
+    # ── Trend: EMA9 vs EMA21 ──────────────────
+    if ema9 > ema21:
+        score += 1
+        reasons.append(("bull", "EMA9 > EMA21 (uptrend)"))
+    else:
+        score -= 1
+        reasons.append(("bear", "EMA9 < EMA21 (downtrend)"))
+
+    # ── EMA crossover (last candle) ───────────
+    if ind["ema9_prev"] <= ind["ema21_prev"] and ema9 > ema21:
+        score += 2
+        reasons.append(("bull", "EMA9 just crossed ABOVE EMA21 (strong signal)"))
+    elif ind["ema9_prev"] >= ind["ema21_prev"] and ema9 < ema21:
+        score -= 2
+        reasons.append(("bear", "EMA9 just crossed BELOW EMA21 (strong signal)"))
+
+    # ── Price vs VWAP ─────────────────────────
+    if close > vwap:
+        score += 1
+        reasons.append(("bull", f"Price ({close:.0f}) above VWAP ({vwap:.0f})"))
+    else:
+        score -= 1
+        reasons.append(("bear", f"Price ({close:.0f}) below VWAP ({vwap:.0f})"))
+
+    # ── Price vs EMA9 (momentum) ──────────────
+    if close > ema9:
+        score += 1
+        reasons.append(("bull", f"Price above EMA9 ({ema9:.0f})"))
+    else:
+        score -= 1
+        reasons.append(("bear", f"Price below EMA9 ({ema9:.0f})"))
+
+    # ── RSI ───────────────────────────────────
+    if 55 <= rsi <= 75:
+        score += 1
+        reasons.append(("bull", f"RSI {rsi} in bullish zone (55–75)"))
+    elif 25 <= rsi <= 45:
+        score -= 1
+        reasons.append(("bear", f"RSI {rsi} in bearish zone (25–45)"))
+    elif rsi > 80:
+        score -= 1
+        reasons.append(("warn", f"RSI {rsi} overbought — avoid CE"))
+    elif rsi < 20:
+        score += 1
+        reasons.append(("warn", f"RSI {rsi} oversold — possible bounce"))
+
+    # ── High volatility window bonus ─────────
+    if high_vol_window:
+        reasons.append(("info", "Inside high-volatility window (9:15–10:15 AM)"))
+    else:
+        score = int(score * 0.7)   # reduce confidence outside window
+        reasons.append(("warn", "Outside prime scalping window — reduce size"))
+
+    # ── VIX check ─────────────────────────────
+    if vix:
+        if vix > 20:
+            reasons.append(("warn", f"VIX {vix:.1f} elevated — widen stop-loss"))
+        elif vix < 12:
+            reasons.append(("warn", f"VIX {vix:.1f} very low — momentum may be weak"))
+
+    # ── Direction & recommendation ────────────
+    abs_score = abs(score)
+
+    if score >= 3:
+        direction      = "CE"
+        recommendation = "BUY CE"
+        confidence     = "High" if abs_score >= 4 else "Medium"
+        emoji          = "🟢"
+    elif score <= -3:
+        direction      = "PE"
+        recommendation = "BUY PE"
+        confidence     = "High" if abs_score >= 4 else "Medium"
+        emoji          = "🔴"
+    elif abs_score <= 1:
+        direction      = "NEUTRAL"
+        recommendation = "WAIT"
+        confidence     = "Low"
+        emoji          = "🟡"
+    else:
+        direction      = "CE" if score > 0 else "PE"
+        recommendation = "WEAK SIGNAL — AVOID"
+        confidence     = "Low"
+        emoji          = "⚪"
+
+    # ── Target & stop-loss (10–20 pt scalp) ──
+    strike_move = 15   # mid-range of 10–20 pts
+    if direction == "CE":
+        target    = round(close + strike_move, 0)
+        stop_loss = round(close - (strike_move * 0.5), 0)
+    elif direction == "PE":
+        target    = round(close - strike_move, 0)
+        stop_loss = round(close + (strike_move * 0.5), 0)
+    else:
+        target = stop_loss = None
+
+    return {
+        "score":          score,
+        "direction":      direction,
+        "recommendation": recommendation,
+        "confidence":     confidence,
+        "emoji":          emoji,
+        "target":         target,
+        "stop_loss":      stop_loss,
+        "reasons":        reasons,
+    }
+
+# ==============================================================
+# 11. BS GREEKS FALLBACK
+# ==============================================================
+def bs_greeks(S, K, T, r, sigma, option_type):
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return dict(delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+    d1   = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2   = d1 - sigma * np.sqrt(T)
+    pdf1 = norm.pdf(d1)
+    delta = norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1
+    theta = (-(S * pdf1 * sigma) / (2 * np.sqrt(T))
+             + (r * K * np.exp(-r * T) * (norm.cdf(-d2) if option_type == "put" else -norm.cdf(d2))))
+    return dict(
+        delta = round(delta,       4),
+        gamma = round(pdf1 / (S * sigma * np.sqrt(T)), 6),
+        vega  = round(S * pdf1 * np.sqrt(T) / 100, 2),
+        theta = round(theta / 365, 2),
+    )
 
 def validate_token(token):
     try:
@@ -203,57 +456,14 @@ def validate_token(token):
         return False, str(e)
 
 # ==============================================================
-# 8. GREEKS ENGINE
+# 12. REFRESH RATE
 # ==============================================================
-def greeks(S, K, T, r, sigma, option_type):
-    if T <= 0 or sigma <= 0 or S <= 0:
-        return dict(delta=0.0, gamma=0.0, vega=0.0, theta=0.0, rho=0.0)
-    d1   = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2   = d1 - sigma * np.sqrt(T)
-    pdf1 = norm.pdf(d1)
-    if option_type == "call":
-        delta = norm.cdf(d1)
-        theta = (-(S * pdf1 * sigma) / (2 * np.sqrt(T))
-                 - r * K * np.exp(-r * T) * norm.cdf(d2))
-        rho   = K * T * np.exp(-r * T) * norm.cdf(d2) / 100
-    else:
-        delta = norm.cdf(d1) - 1
-        theta = (-(S * pdf1 * sigma) / (2 * np.sqrt(T))
-                 + r * K * np.exp(-r * T) * norm.cdf(-d2))
-        rho   = -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
-    gamma = pdf1 / (S * sigma * np.sqrt(T))
-    vega  = S * pdf1 * np.sqrt(T) / 100
-    return dict(
-        delta = round(delta,       4),
-        gamma = round(gamma,       6),
-        vega  = round(vega,        2),
-        theta = round(theta / 365, 2),
-        rho   = round(rho,         4),
-    )
-
-# ==============================================================
-# 9. HELPERS
-# ==============================================================
-def fmt_inr(v):
-    if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
-    if v >= 1e5: return f"Rs.{v/1e5:.2f} L"
-    return f"Rs.{v:,.0f}"
-
-def sign_str(v):
-    return f"+{v}" if v >= 0 else str(v)
-
-# ==============================================================
-# 10. COMPUTE AUTO VALUES
-# ==============================================================
-conf_selected = None   # set after sidebar
-
-# Auto DTE (computed before sidebar so we can show it)
-# We'll recompute after index selection; placeholder here
+_refresh = get_refresh_ms()
 _now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-_refresh  = get_refresh_ms()
+_high_vol = is_high_volatility_window()
 
 # ==============================================================
-# 11. SIDEBAR
+# 13. SIDEBAR
 # ==============================================================
 with st.sidebar:
     st.markdown("## Scalper Controls")
@@ -261,8 +471,6 @@ with st.sidebar:
 
     selected_index = st.selectbox("Index", list(INDEX_CONFIG.keys()))
     conf = INDEX_CONFIG[selected_index]
-
-    # Auto DTE for selected index
     auto_dte, expiry_date = get_dte(conf["expiry_weekday"])
 
     st.divider()
@@ -272,53 +480,32 @@ with st.sidebar:
     strike_mode   = st.selectbox("Strike Selection", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     strike_offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
 
+    candle_interval = st.selectbox("Candle Interval", ["1", "3", "5"], index=0,
+                                    format_func=lambda x: f"{x} min")
+
     st.divider()
     st.markdown("### Greeks Parameters")
-
-    # IV -- show live VIX value, allow manual override
-    vix_display = (f"India VIX: {st.session_state.last_vix:.2f}%"
-                   if st.session_state.last_vix else "India VIX: fetching...")
-    st.caption(f"Auto IV from {vix_display}")
-
-    auto_iv_pct = round(st.session_state.last_vix, 1) if st.session_state.last_vix else 15.0
-    iv_pct = st.slider(
-        "Implied Volatility (%)",
-        min_value=5, max_value=80,
-        value=int(auto_iv_pct),
-        step=1,
-        help="Auto-set from India VIX. Override manually if needed.",
-    )
-    iv = iv_pct / 100.0
-
-    # DTE -- show auto value, allow manual override
-    st.caption(f"Auto DTE: {auto_dte}d to expiry ({expiry_date.strftime('%d %b')})")
-    dte_days = st.slider(
-        "Days to Expiry",
-        min_value=0, max_value=30,
-        value=auto_dte,
-        step=1,
-        help="Auto-set from weekly expiry calendar. Override if needed.",
-    )
-    dte = dte_days / 365.0
-
+    vix_val = st.session_state.last_vix
+    st.caption(f"Auto IV from India VIX: {vix_val:.2f}%" if vix_val else "Auto IV from India VIX: fetching...")
+    auto_iv = round(vix_val, 1) if vix_val else 15.0
+    iv_pct  = st.slider("Implied Volatility (%)", 5, 80, int(auto_iv), step=1)
+    iv      = iv_pct / 100.0
+    st.caption(f"Auto DTE: {auto_dte}d → {expiry_date.strftime('%d %b')}")
+    dte_days = st.slider("Days to Expiry", 0, 30, auto_dte, step=1)
+    dte      = dte_days / 365.0
     risk_free = st.slider("Risk-Free Rate (%)", 4, 12, 7, step=1)
     r         = risk_free / 100.0
 
     st.divider()
-
-    # Auto refresh display
-    st.caption(f"Auto refresh: {_refresh}ms "
-               f"({'fast' if _refresh == 1000 else 'normal' if _refresh == 2000 else 'slow'})")
+    st.caption(f"Refresh: {_refresh}ms  |  Window: {'🔥 Hot' if _high_vol else '❄️ Calm'}")
 
     st.divider()
     st.markdown("### Connection")
-
     if st.button("Check Token"):
         with st.spinner("Validating..."):
             ok, msg = validate_token(TOKEN)
             st.session_state.token_ok  = ok
             st.session_state.token_msg = msg
-
     if st.session_state.token_ok is True:
         st.success("Token valid")
     elif st.session_state.token_ok is False:
@@ -330,163 +517,282 @@ with st.sidebar:
     st.caption("Market: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
 # ==============================================================
-# 12. FETCH PRICES
+# 14. FETCH SPOT PRICES
 # ==============================================================
-fetch_error = None
-
 if run_live:
-    prices, vix, fetch_error = fetch_all_prices(TOKEN)
+    prices, vix, _ = fetch_all_prices(TOKEN)
     if prices:
         st.session_state.last_prices = prices
-    if vix is not None:
+    if vix:
         st.session_state.last_vix = vix
 
-# Use last known prices if current fetch empty
 all_prices = st.session_state.last_prices
-rkey       = conf["response_key"]
-feed_entry = all_prices.get(rkey)
-
-if feed_entry:
-    spot       = feed_entry["ltp"]
-    change_pct = feed_entry["change_pct"]
-    data_age   = (datetime.now() - feed_entry["ts"]).total_seconds()
-else:
-    spot = change_pct = data_age = None
+feed_entry = all_prices.get(conf["response_key"])
+spot       = feed_entry["ltp"]       if feed_entry else None
+change_pct = feed_entry["change_pct"] if feed_entry else None
+data_age   = (datetime.now() - feed_entry["ts"]).total_seconds() if feed_entry else None
 
 # ==============================================================
-# 13. PAGE HEADER
+# 15. FETCH CANDLES  (every 60s)
+# ==============================================================
+candle_df  = st.session_state.candle_df
+indicators = {}
+candle_err = None
+
+if run_live and spot:
+    candle_age = (
+        (datetime.now() - st.session_state.candle_ts).total_seconds()
+        if st.session_state.candle_ts else 999
+    )
+    if candle_age >= 60:
+        new_df, candle_err = fetch_candles(TOKEN, conf["instrument_key"], int(candle_interval))
+        if new_df is not None and len(new_df) >= 5:
+            st.session_state.candle_df = new_df
+            st.session_state.candle_ts = datetime.now()
+            candle_df = new_df
+
+    if candle_df is not None:
+        candle_df, indicators = compute_indicators(candle_df)
+
+# ==============================================================
+# 16. FETCH OPTION CHAIN  (every 5s)
+# ==============================================================
+step  = conf["strike_step"]
+atm   = int(round(spot / step) * step) if spot else None
+chain = st.session_state.last_chain
+
+if run_live and spot and atm:
+    chain_age = (
+        (datetime.now() - st.session_state.chain_ts).total_seconds()
+        if st.session_state.chain_ts else 999
+    )
+    if chain_age >= 5:
+        expiry_str = expiry_date.strftime("%Y-%m-%d")
+        new_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
+                                           expiry_str, atm, step, n=3)
+        if new_chain:
+            st.session_state.last_chain = new_chain
+            st.session_state.chain_ts   = datetime.now()
+            chain = new_chain
+
+ce_strike = atm - strike_offset * step if atm else None
+pe_strike = atm + strike_offset * step if atm else None
+ce_data   = chain.get(ce_strike, {}) if chain and ce_strike else {}
+pe_data   = chain.get(pe_strike, {}) if chain and pe_strike else {}
+ce_ltp    = ce_data.get("ce_ltp", 0)
+pe_ltp    = pe_data.get("pe_ltp", 0)
+
+if ce_data and ce_data.get("ce_delta"):
+    g_ce = {"delta": round(ce_data["ce_delta"], 4), "theta": round(ce_data["ce_theta"], 2),
+            "gamma": round(ce_data["ce_gamma"], 6), "vega":  round(ce_data["ce_vega"],  2),
+            "iv":    round(ce_data["ce_iv"], 2)}
+    g_pe = {"delta": round(pe_data["pe_delta"], 4), "theta": round(pe_data["pe_theta"], 2),
+            "gamma": round(pe_data["pe_gamma"], 6), "vega":  round(pe_data["pe_vega"],  2),
+            "iv":    round(pe_data["pe_iv"], 2)}
+    greeks_source = "Exchange"
+elif spot and atm:
+    g_ce = bs_greeks(spot, ce_strike, dte, r, iv, "call"); g_ce["iv"] = iv_pct
+    g_pe = bs_greeks(spot, pe_strike, dte, r, iv, "put");  g_pe["iv"] = iv_pct
+    greeks_source = "BS Model"
+else:
+    g_ce = g_pe = None
+    greeks_source = "--"
+
+# ==============================================================
+# 17. GENERATE SIGNAL
+# ==============================================================
+signal = generate_signal(indicators, spot, st.session_state.last_vix, _high_vol)
+
+# ==============================================================
+# 18. PAGE HEADER
 # ==============================================================
 st.markdown(f"# {selected_index} Scalper")
 
 h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
 with h1:
-    if run_live and fetch_error:
-        st.caption(f"🔴 {fetch_error[:40]}")
-    elif run_live and spot:
-        st.caption("🟢 Live")
+    if run_live and spot:
+        st.caption(f"🟢 Live  |  {greeks_source} Greeks")
     elif run_live:
         st.caption("🟡 Fetching...")
     else:
         st.caption("⚪ Paused")
 with h2:
     if data_age is not None:
-        st.caption(f"Updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
+        st.caption(f"Spot: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
 with h3:
     if st.session_state.last_vix:
-        st.caption(f"VIX: {st.session_state.last_vix:.2f}%  |  IV: {iv_pct}%")
+        st.caption(f"VIX: {st.session_state.last_vix:.2f}%")
 with h4:
     st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
 
 st.divider()
 
 # ==============================================================
-# 14. TOP METRICS
+# 19. SIGNAL BOX  (top of page, most prominent)
 # ==============================================================
-step = conf["strike_step"]
+if signal:
+    direction = signal["direction"]
+    rec       = signal["recommendation"]
+    conf_str  = signal["confidence"]
+    emoji     = signal["emoji"]
 
-if spot:
-    atm       = int(round(spot / step) * step)
-    exposure  = spot * lots * conf["lot_size"]
-    ce_strike = atm - strike_offset * step
-    pe_strike = atm + strike_offset * step
-else:
-    atm = ce_strike = pe_strike = exposure = None
+    if direction == "CE":
+        sig_col = st.container()
+        with sig_col:
+            st.success(f"## {emoji} {rec}  —  {ce_strike} CE  |  Confidence: {conf_str}")
+    elif direction == "PE":
+        with st.container():
+            st.error(f"## {emoji} {rec}  —  {pe_strike} PE  |  Confidence: {conf_str}")
+    else:
+        with st.container():
+            st.warning(f"## {emoji} {rec}  |  Score: {signal['score']}")
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric(
-    f"{selected_index} Spot",
-    f"Rs.{spot:,.2f}" if spot else "--",
-    f"{change_pct:+.2f}%" if change_pct is not None else None,
-)
-m2.metric("ATM Strike",     f"{atm:,}"        if atm     else "--")
-m3.metric("Total Exposure", fmt_inr(exposure) if exposure else "--",
-          f"{lots} lot x {conf['lot_size']}"  if exposure else None)
-m4.metric("DTE / Expiry",   f"{dte_days}d",   expiry_date.strftime("%d %b %Y"))
+    # Target / SL row
+    if signal["target"]:
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Signal Score",  f"{signal['score']:+d} / 6")
+        t2.metric("Entry (Spot)",  f"{spot:,.0f}"            if spot else "--")
+        t3.metric("Target",        f"{signal['target']:,.0f}")
+        t4.metric("Stop-Loss",     f"{signal['stop_loss']:,.0f}")
 
-st.divider()
+    # Reason breakdown
+    with st.expander("Signal breakdown", expanded=True):
+        for kind, txt in signal["reasons"]:
+            icons = {"bull": "🟢", "bear": "🔴", "warn": "🟡", "info": "🔵"}
+            st.markdown(f"{icons.get(kind, '•')} {txt}")
+
+    st.divider()
+
+elif run_live and not indicators:
+    st.info("Waiting for candle data to generate signal... (fetched every 60s)")
 
 # ==============================================================
-# 15. GREEKS PANELS
+# 20. TOP METRICS
 # ==============================================================
 if spot and atm:
-    g_ce = greeks(spot, ce_strike, dte, r, iv, "call")
-    g_pe = greeks(spot, pe_strike, dte, r, iv, "put")
+    exposure = spot * lots * conf["lot_size"]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"{selected_index} Spot",
+              f"Rs.{spot:,.2f}", f"{change_pct:+.2f}%" if change_pct else None)
+    m2.metric("ATM Strike",      f"{atm:,}")
+    m3.metric("Notional Exposure", fmt_inr(exposure),
+              f"{lots} lot x {conf['lot_size']}")
+    m4.metric("DTE", f"{dte_days}d", expiry_date.strftime("%d %b %Y"))
+    st.divider()
 
+# ==============================================================
+# 21. INDICATOR SUMMARY BAR
+# ==============================================================
+if indicators:
+    st.markdown("### Technical Indicators")
+    i1, i2, i3, i4, i5 = st.columns(5)
+    close = indicators["close"]
+    ema9  = indicators["ema9"]
+    ema21 = indicators["ema21"]
+    vwap  = indicators["vwap"]
+    rsi   = indicators["rsi"]
+
+    i1.metric("EMA 9",  f"{ema9:,.2f}",
+              "▲ above price" if ema9 > close else "▼ below price")
+    i2.metric("EMA 21", f"{ema21:,.2f}",
+              "Bullish" if ema9 > ema21 else "Bearish")
+    i3.metric("VWAP",   f"{vwap:,.2f}",
+              "Price above" if close > vwap else "Price below")
+    i4.metric("RSI 14", f"{rsi}",
+              "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral")
+    i5.metric("Candle interval", f"{candle_interval}m",
+              f"{len(candle_df)} candles" if candle_df is not None else "--")
+    st.divider()
+
+# ==============================================================
+# 22. GREEKS PANELS
+# ==============================================================
+if spot and atm and g_ce and g_pe:
     col_ce, col_pe = st.columns(2)
 
     with col_ce:
-        st.success(f"### {ce_strike:,} CE -- Call")
+        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "CE") else ""
+        st.success(f"### {ce_strike:,} CE — Call  {label}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Premium",      f"Rs.{ce_ltp:,.2f}" if ce_ltp else "--")
+        p2.metric("Buyer Margin", fmt_inr(ce_ltp * conf["lot_size"] * lots) if ce_ltp else "--")
+        p3.metric("OI",           f"{ce_data.get('ce_oi', 0):,}" if ce_data else "--")
+        st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_ce["delta"], sign_str(g_ce["delta"]))
         b.metric("Theta/day", g_ce["theta"])
         c_.metric("Gamma",    g_ce["gamma"])
         d_, e_, f_ = st.columns(3)
         d_.metric("Vega", g_ce["vega"])
-        e_.metric("Rho",  g_ce["rho"])
-        f_.metric("IV",   f"{iv_pct}%")
+        e_.metric("IV",   f"{g_ce['iv']:.1f}%")
+        f_.metric("Source", greeks_source)
 
     with col_pe:
-        st.error(f"### {pe_strike:,} PE -- Put")
+        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "PE") else ""
+        st.error(f"### {pe_strike:,} PE — Put  {label}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Premium",      f"Rs.{pe_ltp:,.2f}" if pe_ltp else "--")
+        p2.metric("Buyer Margin", fmt_inr(pe_ltp * conf["lot_size"] * lots) if pe_ltp else "--")
+        p3.metric("OI",           f"{pe_data.get('pe_oi', 0):,}" if pe_data else "--")
+        st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_pe["delta"], sign_str(g_pe["delta"]))
         b.metric("Theta/day", g_pe["theta"])
         c_.metric("Gamma",    g_pe["gamma"])
         d_, e_, f_ = st.columns(3)
         d_.metric("Vega", g_pe["vega"])
-        e_.metric("Rho",  g_pe["rho"])
-        f_.metric("IV",   f"{iv_pct}%")
+        e_.metric("IV",   f"{g_pe['iv']:.1f}%")
+        f_.metric("Source", greeks_source)
 
     st.divider()
 
-    # Net position summary
+    # Net summary
     st.markdown("### Net Position Summary")
     net_delta = round(g_ce["delta"] + g_pe["delta"], 4)
     net_theta = round(g_ce["theta"] + g_pe["theta"], 2)
-    net_gamma = round(g_ce["gamma"] + g_pe["gamma"], 6)
-    net_vega  = round(g_ce["vega"]  + g_pe["vega"],  2)
-
-    n1, n2, n3, n4 = st.columns(4)
-    n1.metric("Net Delta", net_delta,
+    n1, n2, n3, n4, n5 = st.columns(5)
+    n1.metric("Total Premium", fmt_inr((ce_ltp + pe_ltp) * conf["lot_size"] * lots))
+    n2.metric("Net Delta",     net_delta,
               "Neutral" if abs(net_delta) < 0.05 else "Directional")
-    n2.metric("Net Theta/day", net_theta)
-    n3.metric("Net Gamma",     net_gamma)
-    n4.metric("Net Vega",      net_vega)
+    n3.metric("Net Theta/day", net_theta)
+    n4.metric("Net Gamma",     round(g_ce["gamma"] + g_pe["gamma"], 6))
+    n5.metric("Net Vega",      round(g_ce["vega"]  + g_pe["vega"],  2))
 
     st.divider()
 
-    # Theta decay projection
-    st.markdown("### Theta Decay Projection")
-    if dte_days > 0:
-        rows = []
-        for day in range(1, min(dte_days + 1, 8)):
-            rem = max((dte_days - day) / 365, 1e-6)
-            gc  = greeks(spot, ce_strike, rem, r, iv, "call")
-            gp  = greeks(spot, pe_strike, rem, r, iv, "put")
-            combined = round((gc["theta"] + gp["theta"]) * lots * conf["lot_size"], 2)
-            rows.append({
-                "Day":                    f"Day +{day}",
-                "DTE Remaining":          dte_days - day,
-                "CE Theta":               gc["theta"],
-                "PE Theta":               gp["theta"],
-                f"Net P&L Rs. x {lots}L": combined,
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("Set DTE > 0 to see the theta decay table.")
+# ==============================================================
+# 23. OPTION CHAIN TABLE
+# ==============================================================
+if chain:
+    st.markdown("### Option Chain — ATM ± 3 Strikes")
+    rows = []
+    for s in sorted(chain.keys()):
+        d = chain[s]
+        rows.append({
+            "Strike":   s,
+            "CE LTP":   f"Rs.{d['ce_ltp']:.2f}",
+            "CE IV%":   f"{d['ce_iv']:.1f}",
+            "CE Delta": f"{d['ce_delta']:.3f}",
+            "CE OI":    f"{d['ce_oi']:,}",
+            "PE LTP":   f"Rs.{d['pe_ltp']:.2f}",
+            "PE IV%":   f"{d['pe_iv']:.1f}",
+            "PE Delta": f"{d['pe_delta']:.3f}",
+            "PE OI":    f"{d['pe_oi']:,}",
+        })
+    df_chain = pd.DataFrame(rows)
 
-else:
-    if not run_live:
-        st.info("Toggle **Start Live Feed** in the sidebar to begin.")
-    elif fetch_error:
-        st.error(f"API error: {fetch_error}")
-    else:
-        st.info("Fetching prices... Market must be open (9:15 AM - 3:30 PM IST).")
+    def highlight_atm(row):
+        color = "background-color: #1a472a; color: white" if row["Strike"] == atm else ""
+        return [color] * len(row)
+
+    st.dataframe(df_chain.style.apply(highlight_atm, axis=1),
+                 use_container_width=True, hide_index=True)
+    st.divider()
 
 # ==============================================================
-# 16. ALL-INDEX OVERVIEW
+# 24. ALL-INDEX OVERVIEW
 # ==============================================================
 if run_live and all_prices:
-    st.divider()
     st.markdown("### All Index Prices")
     rows = []
     for idx_name, idx_conf in INDEX_CONFIG.items():
@@ -494,20 +800,21 @@ if run_live and all_prices:
         if entry:
             dte_i, exp_i = get_dte(idx_conf["expiry_weekday"])
             rows.append({
-                "Index":       idx_name,
-                "LTP":         f"Rs.{entry['ltp']:,.2f}",
-                "Change %":    f"{entry['change_pct']:+.2f}%",
-                "Expiry":      exp_i.strftime("%d %b"),
-                "DTE":         dte_i,
-                "Last Update": entry["ts"].strftime("%H:%M:%S"),
+                "Index":    idx_name,
+                "LTP":      f"Rs.{entry['ltp']:,.2f}",
+                "Change %": f"{entry['change_pct']:+.2f}%",
+                "Expiry":   exp_i.strftime("%d %b"),
+                "DTE":      dte_i,
+                "Updated":  entry["ts"].strftime("%H:%M:%S"),
             })
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No data yet. Market must be open.")
+
+if not run_live:
+    st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
-# 17. AUTO-REFRESH  (rate adapts to market session)
+# 25. AUTO-REFRESH
 # ==============================================================
 if run_live:
     time.sleep(_refresh / 1000)

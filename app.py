@@ -951,7 +951,7 @@ if chain:
         return [color] * len(row)
 
     st.dataframe(df_chain.style.apply(highlight_atm, axis=1),
-                 use_container_width=True, hide_index=True)
+                 width='stretch', hide_index=True)
     st.divider()
 
 # ==============================================================
@@ -973,7 +973,7 @@ if run_live and all_prices:
                 "Updated":  entry["ts"].strftime("%H:%M:%S"),
             })
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 if not run_live:
     st.info("Toggle **Start Live Feed** in the sidebar to begin.")

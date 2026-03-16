@@ -259,12 +259,12 @@ def fetch_all_prices(token):
                 prev_close = float(o_close) if o_close else None
                 today_open = float(o_open)  if o_open  else ltp
 
-                # If prev_close == ltp exactly, the API returned stale/same-day data
-                # Fall back to today_open as an approximation
-                if prev_close and abs(prev_close - ltp) < 0.01:
-                    prev_close = today_open
+                # For NSE indices the "1d" OHLC close = current LTP (running close).
+                # The only true prev-day reference available intraday is today's OPEN,
+                # which NSE sets at the previous session's official close for indices.
+                prev_close = today_open   # open = yesterday's official close for NSE indices
 
-                change_pct = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close and prev_close != ltp else 0.0
+                change_pct = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
                 pts_diff   = round(ltp - prev_close, 2) if prev_close else 0.0
 
                 entry = {

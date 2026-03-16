@@ -214,17 +214,21 @@ def fetch_all_prices(token):
                 q     = quote if isinstance(quote, dict) else (quote.to_dict() if hasattr(quote, "to_dict") else {})
                 ltp   = q.get("last_price") or getattr(quote, "last_price", None)
                 ohlc  = q.get("ohlc", {}) or {}
-                # today's open from OHLC (available intraday)
-                today_open = ohlc.get("open") if isinstance(ohlc, dict) else getattr(ohlc, "open", None)
+                # ohlc.close = PREVIOUS SESSION official close (what Upstox website shows)
+                # ohlc.open  = today open
+                prev_close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
+                today_open = ohlc.get("open")  if isinstance(ohlc, dict) else getattr(ohlc, "open",  None)
                 if ltp is None:
                     continue
                 ltp        = float(ltp)
+                prev_close = float(prev_close) if prev_close else ltp
                 today_open = float(today_open) if today_open else ltp
+                change_pct = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
                 entry = {
                     "ltp":        ltp,
+                    "close":      prev_close,   # previous session official close
                     "today_open": today_open,
-                    "close":      today_open,   # placeholder; real prev close fetched separately
-                    "change_pct": 0.0,          # updated after prev_closes fetched
+                    "change_pct": change_pct,   # computed from prev close — matches Upstox website
                     "ts":         datetime.now(),
                 }
                 if rkey == VIX_RESPONSE_KEY:
@@ -1022,31 +1026,6 @@ with st.sidebar:
 if run_live:
     prices, vix, _ = fetch_all_prices(TOKEN)
     if prices:
-        # Fetch prev day closes once per session (or if stale > 30 min)
-        _pc_ts  = st.session_state.prev_closes_ts
-        _pc_age = (datetime.now() - _pc_ts).total_seconds() if _pc_ts else 9999
-        if _pc_age > 1800 or not st.session_state.prev_closes:
-            _ikeys = [v["instrument_key"] for v in INDEX_CONFIG.values()]
-            _prev  = fetch_prev_day_close(TOKEN, _ikeys)
-            if _prev:
-                st.session_state.prev_closes    = _prev
-                st.session_state.prev_closes_ts = datetime.now()
-
-        # Enrich each price entry with real prev-day close and change %
-        _pc = st.session_state.prev_closes
-        for rkey, entry in prices.items():
-            # Match response key (colon) to instrument key (pipe)
-            _ikey = rkey.replace(":", "|")
-            prev_close = _pc.get(_ikey)
-            if prev_close and prev_close > 0:
-                entry["close"]      = prev_close
-                entry["change_pct"] = round(((entry["ltp"] - prev_close) / prev_close) * 100, 2)
-            else:
-                # Fallback: use today's open as approx prev close
-                entry["change_pct"] = round(
-                    ((entry["ltp"] - entry["today_open"]) / entry["today_open"]) * 100, 2
-                ) if entry.get("today_open") else 0.0
-
         st.session_state.last_prices = prices
     if vix:
         st.session_state.last_vix = vix

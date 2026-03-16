@@ -12,7 +12,7 @@ SETUP:
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -68,8 +68,8 @@ ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 
 # ==============================================================
 # 4. MODULE-LEVEL SHARED STATE
-#    Single-element lists -- mutable from any thread without
-#    needing `global` and without touching st.session_state.
+#    Single-element lists -- safely mutated from daemon threads
+#    without `global` declarations or st.session_state access.
 # ==============================================================
 _price_feed = {}               # ikey -> {ltp, close, change_pct, ts}
 _ws_status  = ["disconnected"] # connecting | live | error:<msg> | disconnected
@@ -78,38 +78,37 @@ _ws_started = [False]
 # ==============================================================
 # 5. SESSION STATE INIT
 # ==============================================================
-if "do_reconnect" not in st.session_state:
-    st.session_state.do_reconnect = False
-if "token_ok" not in st.session_state:
-    st.session_state.token_ok = None
-if "token_msg" not in st.session_state:
-    st.session_state.token_msg = ""
+defaults = {
+    "do_reconnect": False,
+    "token_ok":     None,
+    "token_msg":    "",
+    "live_feed":    False,    # persistent toggle state across reruns
+}
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 # ==============================================================
 # 6. TOKEN VALIDATION
-#    get_market_data_feed_authorize_v3() takes NO arguments
-#    in current SDK versions.
 # ==============================================================
 def validate_token(token):
     try:
         conf = upstox_client.Configuration()
         conf.access_token = token
         api  = upstox_client.WebsocketApi(upstox_client.ApiClient(conf))
-        res  = api.get_market_data_feed_authorize_v3()   # no args
+        res  = api.get_market_data_feed_authorize_v3()
         return True, "Token valid"
     except Exception as e:
         return False, str(e)
 
 # ==============================================================
 # 7. WEBSOCKET FEED
-#    MarketDataStreamerV3 constructor signature (current SDK):
-#      MarketDataStreamerV3(api_client, instrument_keys, mode)
-#    Keys and mode go in the constructor, NOT in on_open.
 # ==============================================================
 def _stream_market_data(token, instrument_keys):
     """
-    Daemon thread -- writes only to module-level state.
-    Never touches st.session_state.
+    Daemon thread.
+    Writes only to module-level _price_feed, _ws_status, _ws_started.
+    Never accesses st.session_state.
     """
     _ws_status[0] = "connecting"
 
@@ -117,13 +116,11 @@ def _stream_market_data(token, instrument_keys):
     configuration.access_token = token
     api_client = upstox_client.ApiClient(configuration)
 
-    # Keys and mode passed directly to constructor
     streamer = upstox_client.MarketDataStreamerV3(
         api_client,
         instrument_keys,
-        "ltpc"        # lowest latency: LTP + close price only
+        "ltpc",
     )
-
     streamer.auto_reconnect(True, 5, 3)
 
     def on_open():
@@ -159,10 +156,10 @@ def _stream_market_data(token, instrument_keys):
         _ws_status[0] = f"error:Reconnect stopped -- {message}"
         _ws_started[0] = False
 
-    streamer.on("open",                on_open)
-    streamer.on("message",             on_message)
-    streamer.on("error",               on_error)
-    streamer.on("close",               on_close)
+    streamer.on("open",                 on_open)
+    streamer.on("message",              on_message)
+    streamer.on("error",                on_error)
+    streamer.on("close",                on_close)
     streamer.on("autoReconnectStopped", on_reconnect_stopped)
 
     try:
@@ -236,7 +233,13 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Strategy")
-    run_live      = st.toggle("Start Live Feed", value=False)
+
+    # Toggle uses session_state key so it persists across st.rerun()
+    run_live = st.toggle(
+        "Start Live Feed",
+        key="live_feed",          # bound to st.session_state["live_feed"]
+    )
+
     lots          = st.number_input("Lots", min_value=1, max_value=500, value=1, step=1)
     strike_mode   = st.selectbox("Strike Selection", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     strike_offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
@@ -292,6 +295,14 @@ with st.sidebar:
 
     st.divider()
     st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
+
+    # Debug panel -- shows exactly what the app sees each cycle
+    with st.expander("Debug Info"):
+        st.write(f"run_live: `{run_live}`")
+        st.write(f"_ws_started: `{_ws_started[0]}`")
+        st.write(f"_ws_status: `{_ws_status[0]}`")
+        st.write(f"price_feed keys: `{list(_price_feed.keys())}`")
+        st.write(f"session live_feed: `{st.session_state.live_feed}`")
 
 # ==============================================================
 # 11. HANDLE RECONNECT

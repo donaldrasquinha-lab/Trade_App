@@ -180,26 +180,48 @@ def fetch_prev_day_close(token, instrument_keys):
 
     for ikey in instrument_keys:
         try:
-            # Capture V3 error explicitly for debug
-            _v3_err = None
+            res  = None
+            errs = []
+
+            # Try 1: HistoryV3Api with from_date + to_date
             try:
                 hist_api = upstox_client.HistoryV3Api(client)
                 res = hist_api.get_historical_candle_data(
-                    ikey, "days", "1",
-                    str(yesterday), str(week_ago)
+                    ikey, "days", "1", str(yesterday), str(week_ago)
                 )
+                if not (res.status == "success" and getattr(res.data, "candles", None)):
+                    res = None
             except Exception as e1:
-                _v3_err = str(e1)
-                # Fallback to legacy HistoryApi
-                hist_api = upstox_client.HistoryApi(client)
-                res = hist_api.get_historical_candle_data(
-                    ikey, "days", "1",
-                    str(yesterday), str(week_ago)
-                )
-            if _v3_err:
-                errors[ikey + "_v3_err"] = _v3_err
+                errs.append(f"V3(5args):{e1}")
+                res = None
 
-            if res.status == "success" and res.data and res.data.candles:
+            # Try 2: HistoryV3Api with only to_date (4 args)
+            if res is None:
+                try:
+                    hist_api = upstox_client.HistoryV3Api(client)
+                    res = hist_api.get_historical_candle_data(
+                        ikey, "days", "1", str(yesterday)
+                    )
+                    if not (res.status == "success" and getattr(res.data, "candles", None)):
+                        res = None
+                except Exception as e2:
+                    errs.append(f"V3(4args):{e2}")
+                    res = None
+
+            # Try 3: HistoryApi with only to_date (4 args)
+            if res is None:
+                try:
+                    hist_api = upstox_client.HistoryApi(client)
+                    res = hist_api.get_historical_candle_data(
+                        ikey, "days", "1", str(yesterday)
+                    )
+                    if not (res.status == "success" and getattr(res.data, "candles", None)):
+                        res = None
+                except Exception as e3:
+                    errs.append(f"Legacy(4args):{e3}")
+                    res = None
+
+            if res and res.status == "success" and getattr(res.data, "candles", None):
                 candles        = res.data.candles
                 candles_sorted = sorted(candles, key=lambda c: c[0], reverse=True)
                 prev_closes[ikey] = float(candles_sorted[0][4])
@@ -209,7 +231,7 @@ def fetch_prev_day_close(token, instrument_keys):
                     for c in candles_sorted[:3]
                 ]
             else:
-                errors[ikey] = f"API returned: status={getattr(res,'status','?')} data={bool(getattr(res,'data',None))}"
+                errors[ikey] = " | ".join(errs) if errs else "All attempts returned empty"
 
         except Exception as e:
             errors[ikey] = str(e)

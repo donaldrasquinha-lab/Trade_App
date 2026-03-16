@@ -149,16 +149,15 @@ def is_high_volatility_window():
 # 6. API: SPOT PRICES + VIX
 # ==============================================================
 
-def fmt_change(ltp, close_price, change_pct, show_pts):
+def fmt_change(ltp, close_price, change_pct, show_pts, pts_diff=None):
     """Returns (display_string, color) for change display."""
     if show_pts:
-        pts = round(ltp - close_price, 2) if close_price else 0
+        pts  = pts_diff if pts_diff is not None else (round(ltp - close_price, 2) if close_price else 0)
         sign = "+" if pts >= 0 else ""
         col  = "#00c853" if pts >= 0 else "#f44336"
         return f"{sign}{pts:.2f} pts", col
     else:
-        sign = "+" if (change_pct or 0) >= 0 else ""
-        col  = "#00c853" if (change_pct or 0) >= 0 else "#f44336"
+        col = "#00c853" if (change_pct or 0) >= 0 else "#f44336"
         return f"{change_pct:+.2f}%" if change_pct is not None else "", col
 
 def fetch_prev_day_close(token, instrument_keys):
@@ -200,6 +199,23 @@ def fetch_prev_day_close(token, instrument_keys):
     return prev_closes
 
 
+def _extract_ohlc_val(ohlc_obj, key):
+    """Safely extract a value from ohlc whether it is a dict or an object."""
+    if ohlc_obj is None:
+        return None
+    if isinstance(ohlc_obj, dict):
+        return ohlc_obj.get(key)
+    # SDK object — try attribute directly
+    val = getattr(ohlc_obj, key, None)
+    if val is not None:
+        return val
+    # Try to_dict fallback
+    if hasattr(ohlc_obj, "to_dict"):
+        d = ohlc_obj.to_dict()
+        return d.get(key)
+    return None
+
+
 def fetch_all_prices(token):
     try:
         conf = upstox_client.Configuration()
@@ -207,34 +223,69 @@ def fetch_all_prices(token):
         api  = upstox_client.MarketQuoteApi(upstox_client.ApiClient(conf))
         keys_str = ",".join(ALL_INSTRUMENT_KEYS + [VIX_INSTRUMENT_KEY])
         res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
-        prices = {}
-        vix    = None
+        prices   = {}
+        vix      = None
+        _debug   = {}   # store raw values for sidebar debug
+
         if res.status == "success" and res.data:
             for rkey, quote in res.data.items():
-                q     = quote if isinstance(quote, dict) else (quote.to_dict() if hasattr(quote, "to_dict") else {})
-                ltp   = q.get("last_price") or getattr(quote, "last_price", None)
-                ohlc  = q.get("ohlc", {}) or {}
-                # ohlc.close = PREVIOUS SESSION official close (what Upstox website shows)
-                # ohlc.open  = today open
-                prev_close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
-                today_open = ohlc.get("open")  if isinstance(ohlc, dict) else getattr(ohlc, "open",  None)
+                # Get raw dict regardless of SDK version
+                if isinstance(quote, dict):
+                    q = quote
+                elif hasattr(quote, "to_dict"):
+                    q = quote.to_dict()
+                else:
+                    q = {}
+
+                ltp        = q.get("last_price") or getattr(quote, "last_price", None)
+                ohlc_raw   = q.get("ohlc") or getattr(quote, "ohlc", None)
+
+                # Extract all OHLC fields
+                o_open  = _extract_ohlc_val(ohlc_raw, "open")
+                o_close = _extract_ohlc_val(ohlc_raw, "close")
+                o_high  = _extract_ohlc_val(ohlc_raw, "high")
+                o_low   = _extract_ohlc_val(ohlc_raw, "low")
+
+                _debug[rkey] = {
+                    "ltp": ltp, "open": o_open,
+                    "close": o_close, "high": o_high, "low": o_low
+                }
+
                 if ltp is None:
                     continue
+
                 ltp        = float(ltp)
-                prev_close = float(prev_close) if prev_close else ltp
-                today_open = float(today_open) if today_open else ltp
-                change_pct = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
+                # ohlc.close from "1d" interval = previous session official close
+                prev_close = float(o_close) if o_close else None
+                today_open = float(o_open)  if o_open  else ltp
+
+                # If prev_close == ltp exactly, the API returned stale/same-day data
+                # Fall back to today_open as an approximation
+                if prev_close and abs(prev_close - ltp) < 0.01:
+                    prev_close = today_open
+
+                change_pct = round(((ltp - prev_close) / prev_close) * 100, 2) if prev_close and prev_close != ltp else 0.0
+                pts_diff   = round(ltp - prev_close, 2) if prev_close else 0.0
+
                 entry = {
                     "ltp":        ltp,
-                    "close":      prev_close,   # previous session official close
+                    "close":      prev_close or ltp,
                     "today_open": today_open,
-                    "change_pct": change_pct,   # computed from prev close — matches Upstox website
+                    "change_pct": change_pct,
+                    "pts_diff":   pts_diff,
                     "ts":         datetime.now(),
                 }
                 if rkey == VIX_RESPONSE_KEY:
                     vix = ltp
                 else:
                     prices[rkey] = entry
+
+        # Store debug info in session state for sidebar display
+        try:
+            st.session_state["_price_debug"] = _debug
+        except Exception:
+            pass
+
         return prices, vix, None
     except Exception as e:
         return {}, None, str(e)
@@ -1020,6 +1071,13 @@ with st.sidebar:
         st.session_state.show_points = not st.session_state.show_points
         st.rerun()
 
+    # Debug expander — shows raw OHLC values from API
+    if st.session_state.get("_price_debug"):
+        with st.expander("🔍 Raw OHLC Debug"):
+            for k, v in st.session_state["_price_debug"].items():
+                st.write(f"**{k}**")
+                st.json(v)
+
 # ==============================================================
 # 14. FETCH SPOT PRICES
 # ==============================================================
@@ -1572,7 +1630,8 @@ with hc2:
     # Spot price — most prominent element
     if spot:
         _close_px = feed_entry.get("close", spot) if feed_entry else spot
-        _chg_str, _chg_col = fmt_change(spot, _close_px, change_pct, st.session_state.show_points)
+        _pts_diff = feed_entry.get("pts_diff") if feed_entry else None
+        _chg_str, _chg_col = fmt_change(spot, _close_px, change_pct, st.session_state.show_points, _pts_diff)
         _age_str  = (f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago"
                      if data_age is not None else "")
         _mode_lbl = "pts" if st.session_state.show_points else "%"
@@ -2382,7 +2441,8 @@ if run_live and all_prices:
             _ltp   = entry["ltp"]
             _close = entry.get("close", _ltp)
             _cpct  = entry.get("change_pct", 0)
-            _chg, _ = fmt_change(_ltp, _close, _cpct, st.session_state.show_points)
+            _pts   = entry.get("pts_diff")
+            _chg, _ = fmt_change(_ltp, _close, _cpct, st.session_state.show_points, _pts)
             rows.append({
                 "Index":       idx_name,
                 "LTP":         f"Rs.{_ltp:,.2f}",

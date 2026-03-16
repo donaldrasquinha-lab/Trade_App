@@ -92,6 +92,8 @@ defaults = {
     "candle_ts_15": None,
     "candle_df_30": None,  # 30m candles
     "candle_ts_30": None,
+    "pcr":          None,   # put-call ratio from chain
+    "fii_data":     None,   # placeholder for FII data
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -634,32 +636,252 @@ else:
     g_ce = g_pe = None
     greeks_source = "--"
 
+
+
+# Compute PCR from option chain (total CE OI vs PE OI across all strikes)
+if chain:
+    total_ce_oi = sum(v.get("ce_oi", 0) for v in chain.values())
+    total_pe_oi = sum(v.get("pe_oi", 0) for v in chain.values())
+    if total_ce_oi > 0:
+        st.session_state.pcr = round(total_pe_oi / total_ce_oi, 2)
+
+# ==============================================================
+# 17b. MARKET OUTLOOK ENGINE
+#      Derives Bullish/Bearish/Sideways + metric table from
+#      live data: VIX, PCR from option chain, RSI, signal score
+# ==============================================================
+def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
+    """
+    Returns outlook dict with overall sentiment and metric rows.
+    PCR > 1.2 = bullish (more puts = hedging), < 0.8 = bearish.
+    VIX > 20 = high fear, < 13 = complacency.
+    """
+    bull_points = 0
+    bear_points = 0
+    metrics     = []
+
+    # VIX
+    if vix is not None:
+        if vix > 22:
+            bear_points += 2
+            vix_sig = ("😨 High Fear / Volatile", "bear")
+        elif vix > 16:
+            bear_points += 1
+            vix_sig = ("😰 Elevated Volatility", "warn")
+        elif vix < 12:
+            bear_points += 1
+            vix_sig = ("😴 Low Fear / Complacency", "warn")
+        else:
+            bull_points += 1
+            vix_sig = ("😌 Normal Volatility", "bull")
+        metrics.append(("India VIX", f"{vix:.2f}", vix_sig[0], vix_sig[1]))
+
+    # PCR
+    if pcr is not None:
+        if pcr > 1.2:
+            bull_points += 2
+            pcr_sig = ("📈 Bullish Bias (heavy put writing)", "bull")
+        elif pcr > 0.9:
+            bull_points += 1
+            pcr_sig = ("➡️ Neutral / Sideways", "neutral")
+        elif pcr > 0.7:
+            bear_points += 1
+            pcr_sig = ("📉 Mildly Bearish", "warn")
+        else:
+            bear_points += 2
+            pcr_sig = ("📉 Bearish Bias (low put writing)", "bear")
+        metrics.append(("Nifty PCR", f"{pcr:.2f}", pcr_sig[0], pcr_sig[1]))
+
+    # RSI
+    if rsi:
+        if rsi > 70:
+            bear_points += 1
+            rsi_sig = ("📉 Overbought (Bearish Momentum)", "bear")
+        elif rsi > 55:
+            bull_points += 1
+            rsi_sig = ("📈 Bullish Momentum", "bull")
+        elif rsi > 45:
+            rsi_sig = ("➡️ Neutral Momentum", "neutral")
+            pass
+        elif rsi > 30:
+            bear_points += 1
+            rsi_sig = ("📉 Weak / Bearish Momentum", "warn")
+        else:
+            bear_points += 2
+            rsi_sig = ("📉 Oversold (Bearish Momentum)", "bear")
+        metrics.append(("Technical RSI", f"{rsi:.0f}", rsi_sig[0], rsi_sig[1]))
+
+    # Intraday change
+    if change_pct is not None:
+        if change_pct > 0.5:
+            bull_points += 1
+            chg_sig = ("📈 Positive Day", "bull")
+        elif change_pct < -0.5:
+            bear_points += 1
+            chg_sig = ("📉 Negative Day", "bear")
+        else:
+            chg_sig = ("➡️ Flat Day", "neutral")
+        metrics.append(("Intraday Move", f"{change_pct:+.2f}%", chg_sig[0], chg_sig[1]))
+
+    # Signal score from technical indicators
+    if signal_score is not None:
+        if signal_score >= 3:
+            bull_points += 2
+            sig_lbl = ("🟢 Bullish Signal", "bull")
+        elif signal_score <= -3:
+            bear_points += 2
+            sig_lbl = ("🔴 Bearish Signal", "bear")
+        else:
+            sig_lbl = ("🟡 Mixed Signal", "warn")
+        metrics.append(("MTF Signal", f"{signal_score:+d}/6", sig_lbl[0], sig_lbl[1]))
+
+    # Overall verdict
+    total = bull_points + bear_points
+    if total == 0:
+        sentiment = "SIDEWAYS"
+        sent_emoji = "↔️"
+        sent_color = "#ffc107"
+        sent_bg    = "#2a2a00"
+    elif bull_points > bear_points * 1.3:
+        sentiment = "BULLISH"
+        sent_emoji = "📈"
+        sent_color = "#00c853"
+        sent_bg    = "#0d3320"
+    elif bear_points > bull_points * 1.3:
+        sentiment = "BEARISH"
+        sent_emoji = "📉"
+        sent_color = "#f44336"
+        sent_bg    = "#3d0a0a"
+    else:
+        sentiment = "SIDEWAYS"
+        sent_emoji = "↔️"
+        sent_color = "#ffc107"
+        sent_bg    = "#2a2a00"
+
+    return {
+        "sentiment":   sentiment,
+        "emoji":       sent_emoji,
+        "color":       sent_color,
+        "bg":          sent_bg,
+        "bull_points": bull_points,
+        "bear_points": bear_points,
+        "metrics":     metrics,
+    }
+
 # ==============================================================
 # 17. GENERATE SIGNAL
 # ==============================================================
 signal = generate_signal(indicators, spot, st.session_state.last_vix, _high_vol)
 
 # ==============================================================
-# 18. PAGE HEADER
+# 18. PAGE HEADER + MARKET OUTLOOK
 # ==============================================================
-st.markdown(f"# {selected_index} Scalper")
 
-h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
-with h1:
+# Compute outlook
+_signal_score = signal["score"] if signal else None
+_outlook = compute_market_outlook(
+    vix         = st.session_state.last_vix,
+    pcr         = st.session_state.pcr,
+    rsi         = indicators.get("rsi") if indicators else None,
+    signal_score= _signal_score,
+    change_pct  = change_pct,
+)
+
+# ── Title row: name + sentiment badge ────────────────────────
+title_col, sent_col = st.columns([3, 1])
+with title_col:
+    sent = _outlook["sentiment"]
+    col  = _outlook["color"]
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:12px;">'
+        f'<span style="font-size:28px;font-weight:700;">{selected_index} Scalper</span>'
+        f'<span style="background:{_outlook["bg"]};color:{col};border:1.5px solid {col};'
+        f'border-radius:6px;padding:4px 14px;font-size:15px;font-weight:700;letter-spacing:0.05em;">'
+        f'{_outlook["emoji"]} {sent}</span>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
+with sent_col:
     if run_live and spot:
         st.caption(f"🟢 Live  |  {greeks_source} Greeks")
     elif run_live:
         st.caption("🟡 Fetching...")
     else:
         st.caption("⚪ Paused")
-with h2:
+
+# ── Status bar ────────────────────────────────────────────────
+h1, h2, h3 = st.columns(3)
+with h1:
     if data_age is not None:
-        st.caption(f"Spot: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
-with h3:
+        st.caption(f"Spot updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
+with h2:
     if st.session_state.last_vix:
-        st.caption(f"VIX: {st.session_state.last_vix:.2f}%")
-with h4:
+        st.caption(f"VIX: {st.session_state.last_vix:.2f}%  |  PCR: {st.session_state.pcr or '--'}")
+with h3:
     st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
+
+st.divider()
+
+# ── Market Outlook Summary panel ─────────────────────────────
+with st.expander("📊 Market Outlook Summary", expanded=True):
+    oc1, oc2 = st.columns([2, 1])
+    with oc1:
+        # Metric table
+        color_map = {
+            "bull":    ("#00c853", "#0d3320"),
+            "bear":    ("#f44336", "#3d0a0a"),
+            "warn":    ("#ffc107", "#2a2200"),
+            "neutral": ("#90caf9", "#0d1f33"),
+        }
+        rows_html = ""
+        for metric, value, signal_txt, kind in _outlook["metrics"]:
+            fg, bg = color_map.get(kind, ("#ccc", "#1a1a1a"))
+            rows_html += (
+                f'<tr>'
+                f'<td style="padding:8px 12px;color:#ccc;border-bottom:1px solid #333;">{metric}</td>'
+                f'<td style="padding:8px 12px;color:white;font-weight:600;border-bottom:1px solid #333;">{value}</td>'
+                f'<td style="padding:8px 12px;border-bottom:1px solid #333;">'
+                f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:4px;font-size:13px;">'
+                f'{signal_txt}</span></td>'
+                f'</tr>'
+            )
+        table_html = (
+            f'<table style="width:100%;border-collapse:collapse;font-size:14px;">'
+            f'<thead><tr>'
+            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Metric</th>'
+            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Current Value</th>'
+            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Sentiment Signal</th>'
+            f'</tr></thead>'
+            f'<tbody>{rows_html}</tbody>'
+            f'</table>'
+        )
+        st.markdown(table_html, unsafe_allow_html=True)
+
+    with oc2:
+        # Overall verdict card
+        bull = _outlook["bull_points"]
+        bear = _outlook["bear_points"]
+        total_pts = bull + bear or 1
+        bull_pct = int(bull / total_pts * 100)
+        bear_pct = 100 - bull_pct
+        col  = _outlook["color"]
+        bg   = _outlook["bg"]
+        st.markdown(
+            f'<div style="background:{bg};border:1.5px solid {col};border-radius:10px;'
+            f'padding:16px;text-align:center;">'
+            f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.1em;">Overall Sentiment</div>'
+            f'<div style="font-size:32px;margin:6px 0;">{_outlook["emoji"]}</div>'
+            f'<div style="font-size:22px;font-weight:700;color:{col};">{_outlook["sentiment"]}</div>'
+            f'<div style="margin-top:12px;font-size:12px;color:#888;">Bull signals: <b style="color:#00c853;">{bull}</b>'
+            f'&nbsp;&nbsp;Bear signals: <b style="color:#f44336;">{bear}</b></div>'
+            f'<div style="margin-top:10px;background:#111;border-radius:4px;height:8px;overflow:hidden;">'
+            f'<div style="width:{bull_pct}%;height:100%;background:#00c853;float:left;"></div>'
+            f'<div style="width:{bear_pct}%;height:100%;background:#f44336;float:left;"></div>'
+            f'</div>'
+            f'<div style="margin-top:4px;font-size:11px;color:#888;">{bull_pct}% bull &nbsp;/&nbsp; {bear_pct}% bear</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
 st.divider()
 

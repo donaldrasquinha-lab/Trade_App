@@ -2,10 +2,6 @@
 Multi-Index Live Scalper Dashboard
 Upstox REST Market Quote API -- works on Streamlit Cloud
 ---------------------------------------------------------
-No threads. No WebSocket. No state persistence issues.
-Fetches live prices via REST on every rerun (every 1-2s).
-The Upstox Market Quote API returns real-time LTP data.
-
 SETUP:
   1. pip install -r requirements.txt
   2. Create .streamlit/secrets.toml:
@@ -72,48 +68,80 @@ ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 # ==============================================================
 # 4. SESSION STATE INIT
 # ==============================================================
-if "token_ok"   not in st.session_state: st.session_state.token_ok   = None
-if "token_msg"  not in st.session_state: st.session_state.token_msg  = ""
-if "live_feed"  not in st.session_state: st.session_state.live_feed  = False
+if "token_ok"    not in st.session_state: st.session_state.token_ok    = None
+if "token_msg"   not in st.session_state: st.session_state.token_msg   = ""
+if "live_feed"   not in st.session_state: st.session_state.live_feed   = False
 if "last_prices" not in st.session_state: st.session_state.last_prices = {}
+if "show_debug"  not in st.session_state: st.session_state.show_debug  = True
 
 # ==============================================================
-# 5. UPSTOX REST PRICE FETCH
-#    Uses Market Quote OHLC endpoint -- returns real-time LTP.
-#    Called once per rerun when live feed is on.
+# 5. PRICE FETCH  (with full debug output)
 # ==============================================================
-def fetch_all_prices(token):
+def fetch_all_prices(token, debug=False):
     """
-    Fetches LTP for all indices in one API call.
-    Returns dict: instrument_key -> {ltp, close, change_pct}
+    Fetches LTP for all indices via REST.
+    Returns (prices_dict, error_string_or_None).
+    If debug=True writes raw response into st.sidebar.
     """
     try:
         conf = upstox_client.Configuration()
         conf.access_token = token
         api  = upstox_client.MarketQuoteApi(upstox_client.ApiClient(conf))
 
-        # Comma-separated keys for batch fetch
         keys_str = ",".join(ALL_INSTRUMENT_KEYS)
         res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
+
+        if debug:
+            st.sidebar.markdown("**Raw API response:**")
+            st.sidebar.write(f"status: `{res.status}`")
+            st.sidebar.write(f"data type: `{type(res.data)}`")
+            if res.data:
+                st.sidebar.write(f"data keys: `{list(res.data.keys())}`")
+                # Show full first item so we can see field names
+                first_key = list(res.data.keys())[0]
+                first_val = res.data[first_key]
+                st.sidebar.write(f"first key: `{first_key}`")
+                st.sidebar.write(f"first value: `{first_val}`")
+                # Try common field names
+                for attr in ["last_price", "ltp", "close_price", "ohlc",
+                             "last_traded_price", "avg_price"]:
+                    val = getattr(first_val, attr, "NOT FOUND")
+                    st.sidebar.write(f"  .{attr} = `{val}`")
+            else:
+                st.sidebar.write("data is None or empty")
 
         prices = {}
         if res.status == "success" and res.data:
             for ikey, quote in res.data.items():
-                ltp = getattr(quote, "last_price", None)
-                # close price is inside ohlc object
+                # Try all possible LTP field names
+                ltp = (getattr(quote, "last_price",        None) or
+                       getattr(quote, "ltp",               None) or
+                       getattr(quote, "last_traded_price", None))
+
+                # Try all possible close field names
                 ohlc  = getattr(quote, "ohlc", None)
-                close = getattr(ohlc, "close", None) if ohlc else None
+                close = None
+                if ohlc:
+                    close = (getattr(ohlc, "close", None) or
+                             getattr(ohlc, "close_price", None))
+                if close is None:
+                    close = (getattr(quote, "close_price", None) or
+                             getattr(quote, "prev_close",  None))
+
                 if ltp is None:
                     continue
+
                 ltp   = float(ltp)
                 close = float(close) if close else ltp
                 change_pct = round(((ltp - close) / close) * 100, 2) if close else 0.0
+
                 prices[ikey] = {
                     "ltp":        ltp,
                     "close":      close,
                     "change_pct": change_pct,
                     "ts":         datetime.now(),
                 }
+
         return prices, None
 
     except Exception as e:
@@ -125,8 +153,7 @@ def validate_token(token):
         conf = upstox_client.Configuration()
         conf.access_token = token
         api  = upstox_client.MarketQuoteApi(upstox_client.ApiClient(conf))
-        keys_str = ALL_INSTRUMENT_KEYS[0]
-        res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
+        api.get_market_quote_ohlc(ALL_INSTRUMENT_KEYS[0], "1d", "2.0")
         return True, "Token valid"
     except Exception as e:
         return False, str(e)
@@ -224,19 +251,27 @@ with st.sidebar:
     st.divider()
     st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
+    # Debug toggle -- leave ON until prices are confirmed working
+    st.divider()
+    show_debug = st.toggle("Show Debug Info", value=True, key="show_debug")
+
 # ==============================================================
-# 9. FETCH PRICES THIS RERUN
+# 9. FETCH PRICES
 # ==============================================================
 fetch_error = None
 
 if run_live:
-    prices, fetch_error = fetch_all_prices(TOKEN)
+    prices, fetch_error = fetch_all_prices(TOKEN, debug=show_debug)
     if prices:
         st.session_state.last_prices = prices
 else:
     prices = {}
 
-# Use last known prices even if this fetch failed
+# Show fetch error prominently if present
+if fetch_error:
+    st.sidebar.error(f"Fetch error: {fetch_error}")
+
+# Use last known prices if current fetch empty
 all_prices = st.session_state.last_prices
 ikey       = conf["instrument_key"]
 feed_entry = all_prices.get(ikey)
@@ -256,7 +291,7 @@ st.markdown(f"# {selected_index} Scalper")
 h1, h2, h3 = st.columns([2, 2, 3])
 with h1:
     if run_live and fetch_error:
-        st.caption(f"🔴 API error: {fetch_error}")
+        st.caption(f"🔴 API error")
     elif run_live and spot:
         st.caption("🟢 REST feed live")
     elif run_live:
@@ -371,7 +406,7 @@ else:
         st.info("Toggle **Start Live Feed** in the sidebar to begin.")
     elif fetch_error:
         st.error(f"API error: {fetch_error}")
-    elif not spot:
+    else:
         st.info("Fetching prices... Market must be open (9:15 AM - 3:30 PM IST).")
 
 # ==============================================================

@@ -1430,6 +1430,7 @@ if (signal and spot and atm
         st.session_state.trade_saved_at = _now
 
 # ==============================================================
+# ==============================================================
 # 18. PAGE HEADER + MARKET OUTLOOK
 # ==============================================================
 
@@ -1442,80 +1443,113 @@ _outlook = compute_market_outlook(
     change_pct  = change_pct,
 )
 
-# ── Title row: name + sentiment badge + ADX badge ────────────
-title_col, sent_col = st.columns([3, 1])
-with title_col:
-    sent = _outlook["sentiment"]
-    col  = _outlook["color"]
+sent = _outlook["sentiment"]
+col  = _outlook["color"]
 
-    # ADX badge values
-    _adx_val  = indicators.get("adx")       if indicators else None
-    _adx_lbl  = indicators.get("adx_label") if indicators else None
-    _adx_dir  = indicators.get("adx_dir")   if indicators else None
-    _plus_di  = indicators.get("plus_di")   if indicators else None
-    _minus_di = indicators.get("minus_di")  if indicators else None
+# ADX badge
+_adx_val  = indicators.get("adx")       if indicators else None
+_adx_lbl  = indicators.get("adx_label") if indicators else None
+_adx_dir  = indicators.get("adx_dir")   if indicators else None
+_plus_di  = indicators.get("plus_di")   if indicators else None
+_minus_di = indicators.get("minus_di")  if indicators else None
 
-    if _adx_val is not None:
-        if _adx_val >= 40:
-            adx_bg, adx_col, adx_icon = "#3d1a00", "#ff6d00", "🔥"
-        elif _adx_val >= 25:
-            adx_bg  = "#0d3320" if _adx_dir == "Bullish" else "#3d0a0a"
-            adx_col = "#00c853" if _adx_dir == "Bullish" else "#f44336"
-            adx_icon = "📈" if _adx_dir == "Bullish" else "📉"
-        elif _adx_val >= 20:
-            adx_bg, adx_col, adx_icon = "#1a1a2e", "#90caf9", "〰️"
-        else:
-            adx_bg, adx_col, adx_icon = "#2a2a1a", "#ffc107", "↔️"
-        di_str = f"+DI {_plus_di:.0f} / -DI {_minus_di:.0f}" if _plus_di and _minus_di else ""
-        adx_badge = (
-            f'<span style="background:{adx_bg};color:{adx_col};'
-            f'border:1.5px solid {adx_col};border-radius:6px;'
-            f'padding:4px 12px;font-size:13px;font-weight:700;white-space:nowrap;">'
-            f'{adx_icon} ADX {_adx_val:.0f} — {_adx_lbl} '
-            f'<span style="font-size:11px;opacity:0.75;">{di_str}</span>'
-            f'</span>'
-        )
+if _adx_val is not None:
+    if _adx_val >= 40:
+        adx_bg, adx_col, adx_icon = "#3d1a00", "#ff6d00", "🔥"
+    elif _adx_val >= 25:
+        adx_bg  = "#0d3320" if _adx_dir == "Bullish" else "#3d0a0a"
+        adx_col = "#00c853" if _adx_dir == "Bullish" else "#f44336"
+        adx_icon = "📈" if _adx_dir == "Bullish" else "📉"
+    elif _adx_val >= 20:
+        adx_bg, adx_col, adx_icon = "#1a1a2e", "#90caf9", "〰️"
     else:
-        adx_badge = '<span style="color:#888;font-size:13px;padding:4px 8px;">ADX: computing...</span>'
+        adx_bg, adx_col, adx_icon = "#2a2a1a", "#ffc107", "↔️"
+    di_str    = f"+DI {_plus_di:.0f} / -DI {_minus_di:.0f}" if _plus_di and _minus_di else ""
+    adx_badge = (
+        f'<span style="background:{adx_bg};color:{adx_col};'
+        f'border:1.5px solid {adx_col};border-radius:6px;'
+        f'padding:3px 10px;font-size:12px;font-weight:700;white-space:nowrap;">'
+        f'{adx_icon} ADX {_adx_val:.0f} — {_adx_lbl} '
+        f'<span style="font-size:10px;opacity:0.75;">{di_str}</span>'
+        f'</span>'
+    )
+else:
+    adx_badge = ''
 
-    # Spot badge shown inline next to sentiment
-    if spot:
-        _chg_col   = "#00c853" if (change_pct and change_pct >= 0) else "#f44336"
-        _chg_str   = f"{change_pct:+.2f}%" if change_pct else ""
-        _spot_badge = (
-            f'<span style="font-size:22px;font-weight:600;color:white;margin:0 4px;">'            f'Rs.{spot:,.2f}'            f'<span style="font-size:13px;color:{_chg_col};margin-left:5px;">{_chg_str}</span>'            f'</span>'
-        )
-    else:
-        _spot_badge = '<span style="font-size:18px;color:#888;margin:0 6px;">—</span>'
+# ── Main header layout: 3 columns ──────────────────────────
+# Col 1: Index title + Live status (small)
+# Col 2: Spot Price (large, prominent)
+# Col 3: Market Sentiment badge + ADX
+# ──────────────────────────────────────────────────────────
+hc1, hc2, hc3 = st.columns([2, 2, 3])
 
+with hc1:
+    # Index name + feed status
+    _status_icon = "🟢" if (run_live and spot) else ("🟡" if run_live else "⚪")
+    _status_txt  = "Live" if (run_live and spot) else ("Connecting..." if run_live else "Paused")
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'        f'<span style="font-size:26px;font-weight:700;">{selected_index} Scalper</span>'        f'<span style="background:{_outlook["bg"]};color:{col};border:1.5px solid {col};'        f'border-radius:6px;padding:4px 14px;font-size:15px;font-weight:700;">'        f'{_outlook["emoji"]} {sent}</span>'        f'{_spot_badge}'        f'{adx_badge}'        f'</div>',
+        f'<div style="padding-top:4px;">'
+        f'<div style="font-size:22px;font-weight:700;color:var(--color-text-primary);">'
+        f'{selected_index}</div>'
+        f'<div style="font-size:12px;color:#888;margin-top:2px;">'
+        f'{_status_icon} {_status_txt} &nbsp;|&nbsp; {greeks_source} Greeks</div>'
+        f'<div style="font-size:11px;color:#888;margin-top:1px;">'
+        f'Expiry: {expiry_date.strftime("%d %b")} ({dte_days}d)'
+        f'{"  |  ATM: " + str(f"{atm:,}") if atm else ""}'
+        f'</div></div>',
         unsafe_allow_html=True
     )
-with sent_col:
-    if run_live and spot:
-        st.caption(f"🟢 Live  |  {greeks_source} Greeks")
-    elif run_live:
-        st.caption("🟡 Fetching...")
+
+with hc2:
+    # Spot price — most prominent element
+    if spot:
+        _chg_col = "#00c853" if (change_pct and change_pct >= 0) else "#f44336"
+        _chg_str = f"{change_pct:+.2f}%" if change_pct else ""
+        _age_str = (f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago"
+                    if data_age is not None else "")
+        st.markdown(
+            f'<div style="padding-top:2px;">'
+            f'<div style="font-size:11px;color:#888;text-transform:uppercase;'
+            f'letter-spacing:0.08em;margin-bottom:2px;">Spot Price</div>'
+            f'<div style="font-size:28px;font-weight:700;color:white;line-height:1.1;">'
+            f'Rs.{spot:,.2f}</div>'
+            f'<div style="font-size:13px;margin-top:2px;">'
+            f'<span style="color:{_chg_col};font-weight:600;">{_chg_str}</span>'
+            f'<span style="color:#888;margin-left:8px;font-size:11px;">{_age_str}</span>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
     else:
-        st.caption("⚪ Paused")
+        st.markdown(
+            '<div style="padding-top:2px;">'
+            '<div style="font-size:11px;color:#888;text-transform:uppercase;'
+            'letter-spacing:0.08em;margin-bottom:2px;">Spot Price</div>'
+            '<div style="font-size:28px;font-weight:700;color:#555;">—</div>'
+            '<div style="font-size:11px;color:#888;margin-top:2px;">Enable Live Feed</div>'
+            '</div>',
+            unsafe_allow_html=True
+        )
 
-
-# ── Status bar ────────────────────────────────────────────────
-h1, h2 = st.columns(2)
-with h1:
-    _sb = []
-    if data_age is not None:
-        _sb.append(f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
-    if st.session_state.last_vix:
-        _sb.append(f"VIX: {st.session_state.last_vix:.2f}%")
-    if _sb:
-        st.caption("  |  ".join(_sb))
-with h2:
-    _atm_str = f"  |  ATM: {atm:,}" if atm else ""
-    st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d){_atm_str}")
+with hc3:
+    # Sentiment badge + ADX + VIX
+    vix_val = st.session_state.last_vix
+    vix_str = f"VIX: {vix_val:.2f}%" if vix_val else ""
+    st.markdown(
+        f'<div style="padding-top:4px;">'
+        f'<div style="margin-bottom:6px;">'
+        f'<span style="background:{_outlook["bg"]};color:{col};'
+        f'border:1.5px solid {col};border-radius:6px;'
+        f'padding:5px 16px;font-size:16px;font-weight:700;letter-spacing:0.05em;">'
+        f'{_outlook["emoji"]} {sent}</span>'
+        f'</div>'
+        f'<div style="margin-bottom:4px;">{adx_badge}</div>'
+        f'<div style="font-size:11px;color:#888;">{vix_str}</div>'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
 st.divider()
+
 
 # ── Market Outlook Summary panel ─────────────────────────────
 with st.expander("📊 Market Outlook Summary", expanded=True):

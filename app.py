@@ -67,39 +67,46 @@ INDEX_CONFIG = {
 ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 
 # ─────────────────────────────────────────────
-# 4. SESSION STATE INITIALISATION
-# ─────────────────────────────────────────────
-if "price_feed" not in st.session_state:
-    st.session_state.price_feed = {}
-
-if "ws_status" not in st.session_state:
-    st.session_state.ws_status = "disconnected"
-
-if "ws_error_msg" not in st.session_state:
-    st.session_state.ws_error_msg = ""
-
-if "ws_thread_started" not in st.session_state:
-    st.session_state.ws_thread_started = False
-
-# ─────────────────────────────────────────────
-# 5. WEBSOCKET FEED  (upstox_client.MarketDataStreamer)
+# 4. MODULE-LEVEL SHARED STATE
+#    Plain dicts/lists at module level — safe to
+#    read/write from any thread without touching
+#    st.session_state inside background threads.
 # ─────────────────────────────────────────────
 
-def _stream_market_data(
-    token: str,
-    instrument_keys: list,
-    price_feed: dict,
-    status_holder: list,
-):
+# instrument_key → {ltp, close, change_pct, ts}
+_price_feed: dict = {}
+
+# Single-element list so threads can write status back
+_ws_status: list = ["disconnected"]   # "connecting" | "live" | "error:<msg>" | "disconnected"
+
+# Guard so we only start one thread per process
+_ws_thread_started: bool = False
+
+
+# ─────────────────────────────────────────────
+# 5. SESSION STATE  (main thread only)
+# ─────────────────────────────────────────────
+if "ws_thread_launched" not in st.session_state:
+    st.session_state.ws_thread_launched = False
+
+
+# ─────────────────────────────────────────────
+# 6. WEBSOCKET FEED
+# ─────────────────────────────────────────────
+
+def _stream_market_data(token: str, instrument_keys: list):
     """
-    Uses upstox_client.MarketDataStreamer — the SDK handles proto
-    decoding internally so no protoc compile step is needed.
-    The on_message callback receives an already-decoded Python dict.
+    Runs in a daemon thread.
+    Uses upstox_client.MarketDataStreamer — SDK decodes proto internally.
+    Writes into module-level _price_feed and _ws_status only.
+    Never touches st.session_state.
     """
-    status_holder[0] = "connecting"
+    global _ws_status
+
+    _ws_status[0] = "connecting"
 
     def on_open(ws):
-        status_holder[0] = "live"
+        _ws_status[0] = "live"
 
     def on_message(ws, message):
         try:
@@ -112,7 +119,7 @@ def _stream_market_data(
                     continue
                 ltp = float(ltp)
                 cp  = float(cp) if cp else ltp
-                price_feed[ikey] = {
+                _price_feed[ikey] = {
                     "ltp":        ltp,
                     "close":      cp,
                     "change_pct": round(((ltp - cp) / cp) * 100, 2) if cp else 0.0,
@@ -122,10 +129,10 @@ def _stream_market_data(
             pass
 
     def on_error(ws, error):
-        status_holder[0] = f"error:{error}"
+        _ws_status[0] = f"error:{error}"
 
     def on_close(ws, *args):
-        status_holder[0] = "disconnected"
+        _ws_status[0] = "disconnected"
 
     try:
         api_client = upstox_client.ApiClient(
@@ -134,66 +141,43 @@ def _stream_market_data(
         streamer = upstox_client.MarketDataStreamer(
             api_client,
             instrument_keys,
-            "ltpc",   # lowest latency: LTP + close price only
+            "ltpc",
         )
         streamer.on("open",    on_open)
         streamer.on("message", on_message)
         streamer.on("error",   on_error)
         streamer.on("close",   on_close)
-        streamer.connect()    # blocking — runs inside daemon thread
+        streamer.connect()   # blocking
 
     except Exception as e:
-        status_holder[0] = f"error:{e}"
+        _ws_status[0] = f"error:{e}"
 
 
 def start_websocket_feed():
-    """Launch MarketDataStreamer in a background daemon thread."""
-    if st.session_state.ws_thread_started:
+    """Launch the streamer daemon thread once per process."""
+    global _ws_thread_started
+
+    if _ws_thread_started:
         return
 
-    # Mutable list so the async thread can write status back
-    status_holder = ["connecting"]
+    threading.Thread(
+        target=_stream_market_data,
+        args=(TOKEN, ALL_INSTRUMENT_KEYS),
+        daemon=True,
+        name="upstox-streamer",
+    ).start()
 
-    def _run():
-        _stream_market_data(
-            TOKEN,
-            ALL_INSTRUMENT_KEYS,
-            st.session_state.price_feed,
-            status_holder,
-        )
-
-    def _watch_status():
-        """Mirror status_holder into session_state for Streamlit to read."""
-        while True:
-            raw = status_holder[0]
-            if raw.startswith("error:"):
-                st.session_state.ws_status    = "error"
-                st.session_state.ws_error_msg = raw[6:]
-                break
-            st.session_state.ws_status = raw
-            time.sleep(0.3)
-
-    threading.Thread(target=_run,          daemon=True, name="upstox-streamer").start()
-    threading.Thread(target=_watch_status, daemon=True, name="status-watcher").start()
-    st.session_state.ws_thread_started = True
+    _ws_thread_started = True
+    st.session_state.ws_thread_launched = True
 
 
 # ─────────────────────────────────────────────
-# 6. BLACK-SCHOLES GREEKS ENGINE
+# 7. BLACK-SCHOLES GREEKS
 # ─────────────────────────────────────────────
 
 def black_scholes_greeks(
     S: float, K: float, T: float, r: float, sigma: float, option_type: str
 ) -> dict:
-    """
-    Full first-order Greeks for a European option.
-    S     = spot price
-    K     = strike price
-    T     = time to expiry in years
-    r     = risk-free rate  (e.g. 0.07 for 7%)
-    sigma = implied volatility (e.g. 0.15 for 15%)
-    Returns: delta, gamma, vega, theta (per calendar day), rho
-    """
     if T <= 0 or sigma <= 0 or S <= 0:
         return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
 
@@ -217,19 +201,19 @@ def black_scholes_greeks(
         rho = -K * T * np.exp(-r * T) * norm.cdf(-d2) / 100
 
     gamma = pdf_d1 / (S * sigma * np.sqrt(T))
-    vega  = S * pdf_d1 * np.sqrt(T) / 100   # per 1% move in IV
+    vega  = S * pdf_d1 * np.sqrt(T) / 100
 
     return {
-        "delta": round(delta,             4),
-        "gamma": round(gamma,             6),
-        "vega":  round(vega,              2),
+        "delta": round(delta,              4),
+        "gamma": round(gamma,              6),
+        "vega":  round(vega,               2),
         "theta": round(theta_annual / 365, 2),
-        "rho":   round(rho,               4),
+        "rho":   round(rho,                4),
     }
 
 
 # ─────────────────────────────────────────────
-# 7. FORMATTING HELPERS
+# 8. HELPERS
 # ─────────────────────────────────────────────
 
 def fmt_inr(value: float) -> str:
@@ -244,8 +228,13 @@ def sign_str(v: float) -> str:
     return f"+{v}" if v >= 0 else str(v)
 
 
+def ws_status_str() -> str:
+    """Read the module-level status safely from main thread."""
+    return _ws_status[0]
+
+
 # ─────────────────────────────────────────────
-# 8. SIDEBAR
+# 9. SIDEBAR
 # ─────────────────────────────────────────────
 
 with st.sidebar:
@@ -282,40 +271,42 @@ with st.sidebar:
         format_func=lambda x: f"{x}ms",
     )
 
-    # ── WebSocket status ──────────────────────
+    # ── WebSocket status indicator ────────────
     st.divider()
-    ws_status = st.session_state.ws_status
-    if ws_status == "live":
+    status = ws_status_str()
+
+    if status == "live":
         st.success("🟢 WebSocket: Live")
-    elif ws_status == "connecting":
+    elif status == "connecting":
         st.info("🟡 WebSocket: Connecting…")
-    elif ws_status == "error":
-        st.error(f"🔴 Error: {st.session_state.ws_error_msg}")
+    elif status.startswith("error:"):
+        st.error(f"🔴 Error: {status[6:]}")
     else:
         st.caption("⚪ WebSocket: Not started")
 
-    # Reconnect button after failure
-    if ws_status in ("error", "disconnected") and st.session_state.ws_thread_started:
+    # Reconnect button if feed dropped
+    if status in ("disconnected",) and _ws_thread_started:
         if st.button("🔄 Reconnect"):
-            st.session_state.ws_thread_started = False
-            st.session_state.ws_status = "disconnected"
+            global _ws_thread_started
+            _ws_thread_started = False
+            st.session_state.ws_thread_launched = False
             st.rerun()
 
 
 # ─────────────────────────────────────────────
-# 9. START FEED ON TOGGLE
+# 10. START FEED
 # ─────────────────────────────────────────────
 
-if run_live and not st.session_state.ws_thread_started:
+if run_live and not _ws_thread_started:
     start_websocket_feed()
 
 
 # ─────────────────────────────────────────────
-# 10. PULL LATEST DATA FOR SELECTED INDEX
+# 11. READ LATEST PRICE (from module-level dict)
 # ─────────────────────────────────────────────
 
 ikey       = conf["instrument_key"]
-feed_entry = st.session_state.price_feed.get(ikey) if run_live else None
+feed_entry = _price_feed.get(ikey) if run_live else None
 
 if feed_entry:
     spot        = feed_entry["ltp"]
@@ -327,17 +318,18 @@ else:
 
 
 # ─────────────────────────────────────────────
-# 11. PAGE HEADER
+# 12. PAGE HEADER
 # ─────────────────────────────────────────────
 
 st.markdown(f"# ⚡ {selected_index} Scalper")
 
 h1, h2, h3 = st.columns([2, 2, 3])
 with h1:
-    if run_live and ws_status == "live":
+    status = ws_status_str()
+    if run_live and status == "live":
         st.caption("🟢 Source: WebSocket V3 — SDK Streamer")
     elif run_live:
-        st.caption(f"🟡 {ws_status.capitalize()}…")
+        st.caption(f"🟡 {status.capitalize()}…")
     else:
         st.caption("⚪ Paused — enable Live Feed in sidebar")
 with h2:
@@ -350,7 +342,7 @@ st.divider()
 
 
 # ─────────────────────────────────────────────
-# 12. TOP METRICS ROW
+# 13. TOP METRICS
 # ─────────────────────────────────────────────
 
 step = conf["strike_step"]
@@ -369,8 +361,8 @@ m1.metric(
     f"₹{spot:,.2f}" if spot else "—",
     f"{change_pct:+.2f}%" if change_pct is not None else None,
 )
-m2.metric("🎯 ATM Strike",     f"{atm:,}"         if atm      else "—")
-m3.metric("💰 Total Exposure",  fmt_inr(exposure) if exposure  else "—",
+m2.metric("🎯 ATM Strike",      f"{atm:,}"         if atm      else "—")
+m3.metric("💰 Total Exposure",   fmt_inr(exposure) if exposure  else "—",
           f"{lots} lot × {conf['lot_size']}" if exposure else None)
 m4.metric("📅 DTE", f"{dte_days}d", f"IV {iv_pct}%")
 
@@ -378,7 +370,7 @@ st.divider()
 
 
 # ─────────────────────────────────────────────
-# 13. GREEKS PANELS
+# 14. GREEKS PANELS
 # ─────────────────────────────────────────────
 
 if spot and atm:
@@ -439,10 +431,10 @@ if spot and atm:
             gp  = black_scholes_greeks(spot, pe_strike, rem, r, iv, "put")
             combined = round((gc["theta"] + gp["theta"]) * lots * conf["lot_size"], 2)
             rows.append({
-                "Day":               f"Day +{day}",
-                "DTE Remaining":     dte_days - day,
-                "CE Theta":          gc["theta"],
-                "PE Theta":          gp["theta"],
+                "Day":                   f"Day +{day}",
+                "DTE Remaining":         dte_days - day,
+                "CE Theta":              gc["theta"],
+                "PE Theta":              gp["theta"],
                 f"Net P&L ₹ × {lots}L": combined,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -454,16 +446,16 @@ else:
 
 
 # ─────────────────────────────────────────────
-# 14. ALL-INDEX OVERVIEW
+# 15. ALL-INDEX OVERVIEW
 # ─────────────────────────────────────────────
 
-if run_live and st.session_state.price_feed:
+if run_live and _price_feed:
     st.divider()
     st.markdown("### 🌐 All Index Prices")
 
     rows = []
     for idx_name, idx_conf in INDEX_CONFIG.items():
-        entry = st.session_state.price_feed.get(idx_conf["instrument_key"])
+        entry = _price_feed.get(idx_conf["instrument_key"])
         if entry:
             rows.append({
                 "Index":       idx_name,
@@ -480,7 +472,7 @@ if run_live and st.session_state.price_feed:
 
 
 # ─────────────────────────────────────────────
-# 15. AUTO-REFRESH LOOP
+# 16. AUTO-REFRESH
 # ─────────────────────────────────────────────
 
 if run_live:

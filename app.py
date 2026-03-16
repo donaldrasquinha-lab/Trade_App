@@ -180,7 +180,9 @@ def fetch_prev_day_close(token, instrument_keys):
 
     for ikey in instrument_keys:
         try:
-            # Try V3 first
+            # HistoryV3Api.get_historical_candle_data(instrument_key, unit, interval, to_date, from_date)
+            # HistoryApi.get_historical_candle_data(instrument_key, unit, interval, to_date, from_date)
+            # Both take exactly 5 positional args — no API version string
             try:
                 hist_api = upstox_client.HistoryV3Api(client)
                 res = hist_api.get_historical_candle_data(
@@ -188,11 +190,11 @@ def fetch_prev_day_close(token, instrument_keys):
                     str(yesterday), str(week_ago)
                 )
             except Exception as e1:
-                # Fallback to legacy HistoryApi
+                # Fallback to legacy HistoryApi (same 5-arg signature)
                 hist_api = upstox_client.HistoryApi(client)
                 res = hist_api.get_historical_candle_data(
                     ikey, "days", "1",
-                    str(yesterday), str(week_ago), "2.0"
+                    str(yesterday), str(week_ago)
                 )
 
             if res.status == "success" and res.data and res.data.candles:

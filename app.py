@@ -1,7 +1,7 @@
 """
 Multi-Index Live Scalper Dashboard
-Upstox MarketDataStreamerV3 (SDK built-in) -- no proto compile needed
----------------------------------------------------------------------
+Upstox MarketDataStreamerV3 -- no proto compile needed
+------------------------------------------------------
 SETUP:
   1. pip install -r requirements.txt
   2. Create .streamlit/secrets.toml:
@@ -68,48 +68,47 @@ ALL_INSTRUMENT_KEYS = [v["instrument_key"] for v in INDEX_CONFIG.values()]
 
 # ==============================================================
 # 4. MODULE-LEVEL SHARED STATE
-#    Single-element lists so daemon threads can mutate values
-#    without `global` declarations and without touching
-#    st.session_state (which is not accessible from threads).
+#    Single-element lists -- mutable from any thread without
+#    needing `global` and without touching st.session_state.
 # ==============================================================
 _price_feed = {}               # ikey -> {ltp, close, change_pct, ts}
 _ws_status  = ["disconnected"] # connecting | live | error:<msg> | disconnected
 _ws_started = [False]
 
 # ==============================================================
-# 5. SESSION STATE INIT  (main thread only)
+# 5. SESSION STATE INIT
 # ==============================================================
 if "do_reconnect" not in st.session_state:
     st.session_state.do_reconnect = False
-
 if "token_ok" not in st.session_state:
-    st.session_state.token_ok = None   # None = unchecked, True = ok, False = bad
+    st.session_state.token_ok = None
+if "token_msg" not in st.session_state:
+    st.session_state.token_msg = ""
 
 # ==============================================================
 # 6. TOKEN VALIDATION
-#    Runs once per session to verify the token before connecting.
+#    get_market_data_feed_authorize_v3() takes NO arguments
+#    in current SDK versions.
 # ==============================================================
 def validate_token(token):
-    """
-    Calls the WS authorize endpoint to confirm the token is valid.
-    Returns (True, url) or (False, error_message).
-    """
     try:
         conf = upstox_client.Configuration()
         conf.access_token = token
         api  = upstox_client.WebsocketApi(upstox_client.ApiClient(conf))
-        res  = api.get_market_data_feed_authorize_v3("2.0")
-        return True, res.data.authorized_redirect_uri
+        res  = api.get_market_data_feed_authorize_v3()   # no args
+        return True, "Token valid"
     except Exception as e:
         return False, str(e)
 
 # ==============================================================
-# 7. WEBSOCKET FEED  -- MarketDataStreamerV3
+# 7. WEBSOCKET FEED
+#    MarketDataStreamerV3 constructor signature (current SDK):
+#      MarketDataStreamerV3(api_client, instrument_keys, mode)
+#    Keys and mode go in the constructor, NOT in on_open.
 # ==============================================================
 def _stream_market_data(token, instrument_keys):
     """
-    Runs in a daemon thread.
-    Writes only to module-level _price_feed, _ws_status, _ws_started.
+    Daemon thread -- writes only to module-level state.
     Never touches st.session_state.
     """
     _ws_status[0] = "connecting"
@@ -118,11 +117,16 @@ def _stream_market_data(token, instrument_keys):
     configuration.access_token = token
     api_client = upstox_client.ApiClient(configuration)
 
-    streamer = upstox_client.MarketDataStreamerV3(api_client)
+    # Keys and mode passed directly to constructor
+    streamer = upstox_client.MarketDataStreamerV3(
+        api_client,
+        instrument_keys,
+        "ltpc"        # lowest latency: LTP + close price only
+    )
+
     streamer.auto_reconnect(True, 5, 3)
 
     def on_open():
-        streamer.subscribe(instrument_keys, "ltpc")
         _ws_status[0] = "live"
 
     def on_message(message):
@@ -255,25 +259,22 @@ with st.sidebar:
     )
 
     st.divider()
-    st.markdown("### Connection Status")
+    st.markdown("### Connection")
 
-    # Token check button
     if st.button("Check Token"):
-        with st.spinner("Validating token..."):
+        with st.spinner("Validating..."):
             ok, msg = validate_token(TOKEN)
-            st.session_state.token_ok = ok
+            st.session_state.token_ok  = ok
             st.session_state.token_msg = msg
 
     if st.session_state.token_ok is True:
         st.success("Token valid")
     elif st.session_state.token_ok is False:
-        st.error(f"Token invalid: {st.session_state.get('token_msg', '')}")
+        st.error(f"Token error: {st.session_state.token_msg}")
     else:
         st.caption("Press Check Token to validate")
 
     st.divider()
-
-    # WebSocket status
     status = _ws_status[0]
     if status == "live":
         st.success("WebSocket: Live")
@@ -284,17 +285,13 @@ with st.sidebar:
     else:
         st.caption("WebSocket: Not started")
 
-    # Reconnect button
     if not _ws_started[0] and status not in ("connecting",):
         if st.button("Reconnect"):
             st.session_state.do_reconnect = True
             st.rerun()
 
-    # Market hours reminder
     st.divider()
-    now_ist = datetime.utcnow().replace(tzinfo=None)
     st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
-    st.caption("No ticks outside market hours.")
 
 # ==============================================================
 # 11. HANDLE RECONNECT
@@ -446,7 +443,6 @@ if spot and atm:
         st.info("Set DTE > 0 to see the theta decay table.")
 
 else:
-    # Show a helpful message depending on state
     s = _ws_status[0]
     if not run_live:
         st.info("Toggle **Start Live Feed** in the sidebar to begin.")
@@ -457,7 +453,7 @@ else:
     elif s.startswith("error:"):
         st.error(f"Feed error: {s[6:]}. Check your token and press Reconnect in the sidebar.")
     else:
-        st.info("Feed not started. Toggle **Start Live Feed** in the sidebar.")
+        st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
 # 17. ALL-INDEX OVERVIEW

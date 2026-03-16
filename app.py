@@ -180,9 +180,8 @@ def fetch_prev_day_close(token, instrument_keys):
 
     for ikey in instrument_keys:
         try:
-            # HistoryV3Api.get_historical_candle_data(instrument_key, unit, interval, to_date, from_date)
-            # HistoryApi.get_historical_candle_data(instrument_key, unit, interval, to_date, from_date)
-            # Both take exactly 5 positional args — no API version string
+            # Capture V3 error explicitly for debug
+            _v3_err = None
             try:
                 hist_api = upstox_client.HistoryV3Api(client)
                 res = hist_api.get_historical_candle_data(
@@ -190,12 +189,15 @@ def fetch_prev_day_close(token, instrument_keys):
                     str(yesterday), str(week_ago)
                 )
             except Exception as e1:
-                # Fallback to legacy HistoryApi (same 5-arg signature)
+                _v3_err = str(e1)
+                # Fallback to legacy HistoryApi
                 hist_api = upstox_client.HistoryApi(client)
                 res = hist_api.get_historical_candle_data(
                     ikey, "days", "1",
                     str(yesterday), str(week_ago)
                 )
+            if _v3_err:
+                errors[ikey + "_v3_err"] = _v3_err
 
             if res.status == "success" and res.data and res.data.candles:
                 candles        = res.data.candles
@@ -1121,7 +1123,7 @@ if run_live:
         # Fetch actual prev-day closes from historical API (once per session)
         _pc_ts  = st.session_state.prev_closes_ts
         _pc_age = (datetime.now() - _pc_ts).total_seconds() if _pc_ts else 9999
-        if _pc_age > 3600 or not st.session_state.prev_closes:
+        if _pc_age > 60 or not st.session_state.prev_closes or "_errors" in st.session_state.prev_closes:
             _ikeys = [v["instrument_key"] for v in INDEX_CONFIG.values()]
             _prev  = fetch_prev_day_close(TOKEN, _ikeys)
             if _prev:

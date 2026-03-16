@@ -162,9 +162,10 @@ def fmt_change(ltp, close_price, change_pct, show_pts, pts_diff=None):
 
 def fetch_prev_day_close(token, instrument_keys):
     """
-    Fetches the previous trading day closing price for each key
-    using the historical daily candle API.
-    Returns dict: instrument_key -> prev_close float
+    Fetches yesterday's official NSE closing price for each index.
+    Uses historical daily candle API — to_date is YESTERDAY so we
+    always get the most recent completed session close.
+    Candle format: [timestamp, open, high, low, close, volume, oi]
     """
     from datetime import timezone as _tz
     prev_closes = {}
@@ -173,25 +174,29 @@ def fetch_prev_day_close(token, instrument_keys):
         conf.access_token = token
         hist_api = upstox_client.HistoryV3Api(upstox_client.ApiClient(conf))
 
-        # Date range: fetch last 5 days to guarantee we get at least 2 trading days
-        now_ist  = datetime.now(_tz.utc) + timedelta(hours=5, minutes=30)
-        to_date  = now_ist.date()
-        from_date = to_date - timedelta(days=7)
+        now_ist   = datetime.now(_tz.utc) + timedelta(hours=5, minutes=30)
+        yesterday = now_ist.date() - timedelta(days=1)
+        week_ago  = now_ist.date() - timedelta(days=10)  # wide range for holidays
 
         for ikey in instrument_keys:
             try:
                 res = hist_api.get_historical_candle_data(
                     ikey, "days", "1",
-                    str(to_date), str(from_date)
+                    str(yesterday),   # to_date = yesterday (no partial today candle)
+                    str(week_ago)
                 )
                 if res.status == "success" and res.data and res.data.candles:
                     candles = res.data.candles
-                    # candles are [ts, open, high, low, close, vol, oi]
-                    # sorted newest first — index 1 = yesterday's close
-                    if len(candles) >= 2:
-                        prev_closes[ikey] = float(candles[1][4])
-                    elif len(candles) == 1:
-                        prev_closes[ikey] = float(candles[0][4])
+                    # Sort by timestamp descending so [0] = most recent completed day
+                    candles_sorted = sorted(candles, key=lambda c: c[0], reverse=True)
+                    # candle = [ts, open, high, low, close, volume, oi]
+                    # [0] = most recent completed session
+                    prev_closes[ikey] = float(candles_sorted[0][4])
+                    # Store all candles for debug
+                    prev_closes[ikey + "_debug"] = [
+                        {"ts": str(c[0])[:10], "o": c[1], "h": c[2], "l": c[3], "c": c[4]}
+                        for c in candles_sorted[:3]
+                    ]
             except Exception:
                 pass
     except Exception:
@@ -1077,6 +1082,16 @@ with st.sidebar:
             for k, v in st.session_state["_price_debug"].items():
                 st.write(f"**{k}**")
                 st.json(v)
+    # Prev closes debug
+    if st.session_state.get("prev_closes"):
+        with st.expander("🔍 Prev Close Debug"):
+            pc = st.session_state.prev_closes
+            for k, v in pc.items():
+                if "_debug" not in k:
+                    dbg = pc.get(k + "_debug", [])
+                    st.write(f"**{k}** → prev_close: {v}")
+                    if dbg:
+                        st.json(dbg)
 
 # ==============================================================
 # 14. FETCH SPOT PRICES
@@ -1084,6 +1099,27 @@ with st.sidebar:
 if run_live:
     prices, vix, _ = fetch_all_prices(TOKEN)
     if prices:
+        # Fetch actual prev-day closes from historical API (once per session)
+        _pc_ts  = st.session_state.prev_closes_ts
+        _pc_age = (datetime.now() - _pc_ts).total_seconds() if _pc_ts else 9999
+        if _pc_age > 3600 or not st.session_state.prev_closes:
+            _ikeys = [v["instrument_key"] for v in INDEX_CONFIG.values()]
+            _prev  = fetch_prev_day_close(TOKEN, _ikeys)
+            if _prev:
+                st.session_state.prev_closes    = _prev
+                st.session_state.prev_closes_ts = datetime.now()
+
+        # Override change_pct and pts_diff using true prev-day close
+        _pc = st.session_state.prev_closes
+        for rkey, entry in prices.items():
+            _ikey      = rkey.replace(":", "|")
+            true_close = _pc.get(_ikey)
+            if true_close and true_close > 0:
+                ltp_v                = entry["ltp"]
+                entry["close"]       = true_close
+                entry["pts_diff"]    = round(ltp_v - true_close, 2)
+                entry["change_pct"]  = round((ltp_v - true_close) / true_close * 100, 2)
+
         st.session_state.last_prices = prices
     if vix:
         st.session_state.last_vix = vix

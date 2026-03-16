@@ -3,95 +3,70 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 import upstox_client
-from upstox_client.rest import ApiException
 import time
 
-# --- 1. SECRETS LOADING ---
-try:
-    TOKEN = st.secrets["upstox"]["access_token"]
-except Exception:
-    st.error("Missing 'access_token' in .streamlit/secrets.toml")
-    st.stop()
+# --- 1. SECRETS ---
+TOKEN = st.secrets["upstox"]["access_token"]
 
-# --- 2. OPTION GREEKS ENGINE ---
+# --- 2. GREEKS ENGINE (Vectorized for speed) ---
 def calculate_greeks(S, K, T, r, sigma, option_type="call"):
-    if T <= 0 or sigma <= 0: return {"delta": 0, "gamma": 0, "theta": 0}
+    if T <= 0 or sigma <= 0: return {"delta": 0, "theta": 0}
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
+    
     if option_type == "call":
         delta = norm.cdf(d1)
         theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2))
     else:
         delta = norm.cdf(d1) - 1
         theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2))
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    return {"delta": round(delta, 2), "gamma": round(gamma, 4), "theta": round(theta / 365, 2)}
+    return {"delta": round(delta, 2), "theta": round(theta / 365, 2)}
 
-# --- 3. UPSTOX API SETUP ---
-def get_api_instance(token):
-    config = upstox_client.Configuration()
-    config.access_token = token
-    return upstox_client.MarketQuoteApi(upstox_client.ApiClient(config))
+# --- 3. UI ---
+st.set_page_config(page_title="Nifty Scalper", layout="wide")
 
-# --- 4. UI LAYOUT ---
-st.set_page_config(page_title="Nifty Live Scalper", layout="wide")
 with st.sidebar:
-    st.header("🛡️ Strategy & Risk")
-    lots = st.number_input("Lots", min_value=1, value=1)
-    lot_size = st.number_input("Lot Size (Nifty)", value=25) 
-    sl_pts = st.number_input("Stop Loss (Points)", value=15.0)
-    strike_mode = st.selectbox("Strike Choice", ["ATM", "1-Strike ITM", "2-Strike ITM"])
-    offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
+    st.header("⚙️ Settings")
+    run_live = st.toggle("🚀 Go Live", value=False)
+    lots = st.number_input("Lots", 1, 100, 1)
+    iv = st.slider("Implied Volatility (IV)", 0.05, 0.50, 0.15)
+    dte = st.slider("Days to Expiry", 0, 7, 4) / 365
 
-st.title("🚀 Nifty Live Scalper Dashboard")
+st.title("⚡ Nifty Live Scalper")
 placeholder = st.empty()
-api_instance = get_api_instance(TOKEN)
 
-# --- 5. PERSISTENT LIVE LOOP ---
-while True:
-    try:
-        # Standard Key for V2
-        instrument_key = "NSE_INDEX|Nifty 50" 
-        api_response = api_instance.ltp(instrument_key, '2.0')
-        
-        # DYNAMIC KEY MATCHING
-        # Check if the requested key exists or find a similar one in the response
-        actual_key = None
-        if hasattr(api_response, 'data') and api_response.data:
-            if instrument_key in api_response.data:
-                actual_key = instrument_key
-            else:
-                # Search for a key containing 'Nifty 50'
-                for key in api_response.data.keys():
-                    if "Nifty 50" in key:
-                        actual_key = key
-                        break
-        
-        if actual_key:
-            spot = api_response.data[actual_key].last_price
+# --- 4. API & LOOP ---
+def get_data():
+    config = upstox_client.Configuration()
+    config.access_token = TOKEN
+    api = upstox_client.MarketQuoteApi(upstox_client.ApiClient(config))
+    # Note: Use 'NSE_INDEX|Nifty 50' for Nifty Spot
+    res = api.get_ltp_full("NSE_INDEX|Nifty 50", '2.0')
+    # Accessing data based on Upstox V2 Response Structure
+    return res.data["NSE_INDEX|Nifty 50"].last_price
+
+if run_live:
+    while True:
+        try:
+            spot = get_data()
             atm = int(round(spot / 50) * 50)
-            ce_strike, pe_strike = atm - (offset * 50), atm + (offset * 50)
             
             with placeholder.container():
-                m1, m2, m3 = st.columns(3)
-                m1.metric("NIFTY 50 SPOT", f"₹{spot}")
-                m2.metric("NET EXPOSURE", f"₹{spot * lots * lot_size:,.0f}")
-                m3.metric("ATM STRIKE", atm)
-                
-                st.divider()
+                cols = st.columns(3)
+                cols[0].metric("SPOT", f"₹{spot}")
+                cols[1].metric("ATM", atm)
+                cols[2].metric("EXP.", f"₹{spot * lots * 25:,.0f}")
+
                 c1, c2 = st.columns(2)
-                with c1:
-                    st.success(f"🟢 CALL: {ce_strike} CE")
-                    g = calculate_greeks(spot, ce_strike, 4/365, 0.07, 0.15, "call")
-                    st.write(f"**Delta:** `{g['delta']}` | **Theta:** `{g['theta']}`")
-                with c2:
-                    st.error(f"🔴 PUT: {pe_strike} PE")
-                    g = calculate_greeks(spot, pe_strike, 4/365, 0.07, 0.15, "put")
-                    st.write(f"**Delta:** `{g['delta']}` | **Theta:** `{g['theta']}`")
-        else:
-            st.error(f"Instrument not found in response. Keys received: {list(api_response.data.keys()) if api_response.data else 'EMPTY'}")
-            
-    except Exception as e:
-        st.error(f"System Error: {e}")
-        break
-    time.sleep(2)
+                ce_g = calculate_greeks(spot, atm, dte, 0.07, iv, "call")
+                pe_g = calculate_greeks(spot, atm, dte, 0.07, iv, "put")
+                
+                c1.info(f"**CALL {atm}**  \nDelta: `{ce_g['delta']}`  \nTheta: `{ce_g['theta']}`")
+                c2.error(f"**PUT {atm}**  \nDelta: `{pe_g['delta']}`  \nTheta: `{pe_g['theta']}`")
+                
+            time.sleep(1) # Frequency limit for Upstox API
+        except Exception as e:
+            st.error(f"Connection Error: {e}")
+            time.sleep(5)
+else:
+    st.warning("Dashboard Paused. Toggle 'Go Live' in the sidebar to start.")

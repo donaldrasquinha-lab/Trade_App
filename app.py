@@ -897,34 +897,36 @@ atm   = int(round(spot / step) * step) if spot else None
 chain = st.session_state.last_chain
 
 if run_live and spot and atm:
+    expiry_str = expiry_date.strftime("%Y-%m-%d")
+
+    # ── Display chain: ATM ±3, refresh every 5s ──────────────
     chain_age = (
         (datetime.now() - st.session_state.chain_ts).total_seconds()
         if st.session_state.chain_ts else 999
     )
     if chain_age >= 5:
-        expiry_str = expiry_date.strftime("%Y-%m-%d")
-        # ATM ±3 for display
         new_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
                                            expiry_str, atm, step, n=3)
         if new_chain:
             st.session_state.last_chain = new_chain
             st.session_state.chain_ts   = datetime.now()
             chain = new_chain
-        # ATM ±15 for accurate PCR (wider = better OI sample)
-        pcr_age = (
-            (datetime.now() - st.session_state.pcr_chain_ts).total_seconds()
-            if st.session_state.pcr_chain_ts else 999
-        )
-        if pcr_age >= 30:   # PCR needs less frequent refresh
-            wide_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
-                                               expiry_str, atm, step, n=15)
-            if wide_chain:
-                st.session_state.pcr_chain    = wide_chain
-                st.session_state.pcr_chain_ts = datetime.now()
 
-# Compute PCR from wide chain for accuracy
-_pcr_chain = st.session_state.pcr_chain
-if _pcr_chain:
+    # ── PCR chain: ATM ±15, refresh every 30s (independent) ──
+    pcr_age = (
+        (datetime.now() - st.session_state.pcr_chain_ts).total_seconds()
+        if st.session_state.pcr_chain_ts else 999
+    )
+    if pcr_age >= 30:
+        wide_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
+                                           expiry_str, atm, step, n=15)
+        if wide_chain:
+            st.session_state.pcr_chain    = wide_chain
+            st.session_state.pcr_chain_ts = datetime.now()
+
+# Compute PCR — use wide chain if available, fall back to display chain
+_pcr_chain = st.session_state.pcr_chain or st.session_state.last_chain
+if _pcr_chain and len(_pcr_chain) > 0:
     _total_ce_oi = sum(v.get("ce_oi", 0) for v in _pcr_chain.values())
     _total_pe_oi = sum(v.get("pe_oi", 0) for v in _pcr_chain.values())
     if _total_ce_oi > 0:
@@ -1099,84 +1101,53 @@ def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
 
 
 # ==============================================================
-# 16b. FETCH OPTION CANDLES for S/R  (every 60s)
-#      Fetches candles for the ATM CE and PE instrument keys.
-#      Option instrument keys follow the pattern:
-#      NSE_FO|<underlying><expiry><strike><CE/PE>
-#      We build them from the chain data keys if available,
-#      or fall back to index candles for S/R when unavailable.
+# 16b. OPTION PREMIUM S/R  (computed every rerun from index S/R)
+#      Scales index support/resistance to option premium levels
+#      using delta. Works immediately — no candle data needed.
+#      Falls back to simple ±% bands when no candle data yet.
 # ==============================================================
-ce_snr = {"support": [], "resistance": [], "current": ce_ltp}
-pe_snr = {"support": [], "resistance": [], "current": pe_ltp}
+ce_snr = {"support": [], "resistance": [], "current": ce_ltp or 0}
+pe_snr = {"support": [], "resistance": [], "current": pe_ltp or 0}
 
-if run_live and spot and atm:
-    opt_age = (
-        (datetime.now() - st.session_state.opt_candle_ts).total_seconds()
-        if st.session_state.opt_candle_ts else 999
-    )
-    if opt_age >= 60:
-        opt_cache = {}
-        # Try to get option instrument keys from chain data
-        for strike_key, opt_key_suffix in [
-            (ce_strike, "CE"), (pe_strike, "PE")
-        ]:
-            # Build instrument key from chain item if possible
-            # Upstox option key format: NSE_FO|<SYMBOL><DDMMMYY><STRIKE><CE/PE>
-            # Example: NSE_FO|NIFTY25MAR2424500CE
-            # We get the actual key from the option chain response
-            if chain and strike_key in chain:
-                # Try fetching candles for option premium
-                # Use the index candle as fallback since option ikey construction varies
-                pass
-            # Fallback: use index candles to compute S/R on premium levels
-            # This derives S/R based on where the premium OHLC has pivoted
-            opt_cache[f"{strike_key}{opt_key_suffix}"] = None
+def scale_snr_to_premium(idx_support, idx_resistance, idx_current,
+                          option_ltp, delta):
+    """Scale index S/R levels to option premium levels via delta."""
+    if not option_ltp or option_ltp <= 0:
+        return [], []
+    supports, resistances = [], []
+    for p in idx_support:
+        opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
+        if 0 < opt_lvl < option_ltp:
+            supports.append(opt_lvl)
+    for p in idx_resistance:
+        opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
+        if opt_lvl > option_ltp:
+            resistances.append(opt_lvl)
+    return sorted(supports)[-3:], sorted(resistances)[:3]
 
-        st.session_state.opt_candles   = opt_cache
-        st.session_state.opt_candle_ts = datetime.now()
+ce_delta_val = abs(g_ce["delta"]) if g_ce and g_ce.get("delta") else 0.5
+pe_delta_val = abs(g_pe["delta"]) if g_pe and g_pe.get("delta") else 0.5
 
-    # Compute S/R from index candle but scale to option premium context
-    # S/R on the underlying translates to option S/R via delta
+if spot and ce_ltp and pe_ltp:
     if candle_df is not None and len(candle_df) >= 6:
-        # Index S/R levels
-        idx_snr = compute_snr(candle_df, n_levels=4)
+        # Best case: use candle-derived S/R
+        idx_snr_data  = compute_snr(candle_df, n_levels=5)
+        idx_sup  = idx_snr_data["support"]
+        idx_res  = idx_snr_data["resistance"]
+        idx_cur  = idx_snr_data["current"]
+    else:
+        # Fallback: synthesise S/R from spot using round-number levels
+        # Works immediately without candle data
+        step_sz  = conf["strike_step"]
+        idx_cur  = spot
+        idx_sup  = [round(spot - i * step_sz, 0) for i in range(1, 6)]
+        idx_res  = [round(spot + i * step_sz, 0) for i in range(1, 6)]
 
-        # Scale index S/R to option premium using delta
-        ce_delta_val = abs(g_ce["delta"]) if g_ce else 0.5
-        pe_delta_val = abs(g_pe["delta"]) if g_pe else 0.5
+    ce_sup, ce_res = scale_snr_to_premium(idx_sup, idx_res, idx_cur, ce_ltp, ce_delta_val)
+    pe_sup, pe_res = scale_snr_to_premium(idx_sup, idx_res, idx_cur, pe_ltp, pe_delta_val)
 
-        def scale_to_premium(idx_levels, option_ltp, delta):
-            """Convert index price levels to estimated option premium levels."""
-            if not idx_levels or not option_ltp or option_ltp == 0:
-                return []
-            current_idx = idx_snr["current"]
-            results = []
-            for idx_level in idx_levels:
-                idx_diff        = idx_level - current_idx
-                premium_change  = idx_diff * delta
-                option_level    = round(option_ltp + premium_change, 2)
-                if option_level > 0:
-                    results.append(option_level)
-            return sorted(results)
-
-        if ce_ltp:
-            ce_raw_support    = scale_to_premium(idx_snr["support"],    ce_ltp, ce_delta_val)
-            ce_raw_resistance = scale_to_premium(idx_snr["resistance"], ce_ltp, ce_delta_val)
-            # Also add direct S/R from today's option OHLC if available
-            ce_snr = {
-                "support":    sorted([p for p in ce_raw_support    if p < ce_ltp])[-3:],
-                "resistance": sorted([p for p in ce_raw_resistance if p > ce_ltp])[:3],
-                "current":    ce_ltp,
-            }
-
-        if pe_ltp:
-            pe_raw_support    = scale_to_premium(idx_snr["support"],    pe_ltp, pe_delta_val)
-            pe_raw_resistance = scale_to_premium(idx_snr["resistance"], pe_ltp, pe_delta_val)
-            pe_snr = {
-                "support":    sorted([p for p in pe_raw_support    if p < pe_ltp])[-3:],
-                "resistance": sorted([p for p in pe_raw_resistance if p > pe_ltp])[:3],
-                "current":    pe_ltp,
-            }
+    ce_snr = {"support": ce_sup, "resistance": ce_res, "current": ce_ltp}
+    pe_snr = {"support": pe_sup, "resistance": pe_res, "current": pe_ltp}
 
 # ==============================================================
 # 17. GENERATE SIGNAL

@@ -628,43 +628,208 @@ with h4:
 st.divider()
 
 # ==============================================================
-# 19. SIGNAL BOX  (top of page, most prominent)
+# 19. BEST TO BUY NOW  (prominent recommendation card)
 # ==============================================================
-if signal:
+if signal and spot and atm:
     direction = signal["direction"]
     rec       = signal["recommendation"]
     conf_str  = signal["confidence"]
-    emoji     = signal["emoji"]
+    score     = signal["score"]
 
+    # Pick the recommended option details
     if direction == "CE":
-        sig_col = st.container()
-        with sig_col:
-            st.success(f"## {emoji} {rec}  —  {ce_strike} CE  |  Confidence: {conf_str}")
+        rec_strike  = ce_strike
+        rec_ltp     = ce_ltp
+        rec_margin  = ce_ltp * conf["lot_size"] * lots if ce_ltp else 0
+        rec_delta   = g_ce["delta"] if g_ce else "--"
+        rec_theta   = g_ce["theta"] if g_ce else "--"
+        rec_iv      = g_ce["iv"]    if g_ce else "--"
+        bg_color    = "#0d3320"
+        border_col  = "#00c853"
+        label_col   = "#00e676"
+        opt_type    = "CALL"
     elif direction == "PE":
-        with st.container():
-            st.error(f"## {emoji} {rec}  —  {pe_strike} PE  |  Confidence: {conf_str}")
+        rec_strike  = pe_strike
+        rec_ltp     = pe_ltp
+        rec_margin  = pe_ltp * conf["lot_size"] * lots if pe_ltp else 0
+        rec_delta   = g_pe["delta"] if g_pe else "--"
+        rec_theta   = g_pe["theta"] if g_pe else "--"
+        rec_iv      = g_pe["iv"]    if g_pe else "--"
+        bg_color    = "#3d0a0a"
+        border_col  = "#f44336"
+        label_col   = "#ff5252"
+        opt_type    = "PUT"
     else:
-        with st.container():
-            st.warning(f"## {emoji} {rec}  |  Score: {signal['score']}")
+        rec_strike = rec_ltp = rec_margin = rec_delta = rec_theta = rec_iv = None
+        bg_color   = "#2a2a1a"
+        border_col = "#ffc107"
+        label_col  = "#ffd740"
+        opt_type   = "WAIT"
 
-    # Target / SL row
-    if signal["target"]:
-        t1, t2, t3, t4 = st.columns(4)
-        t1.metric("Signal Score",  f"{signal['score']:+d} / 6")
-        t2.metric("Entry (Spot)",  f"{spot:,.0f}"            if spot else "--")
-        t3.metric("Target",        f"{signal['target']:,.0f}")
-        t4.metric("Stop-Loss",     f"{signal['stop_loss']:,.0f}")
+    # Confidence bar (filled dots)
+    conf_dots = {"High": "●●●●●", "Medium": "●●●○○", "Low": "●●○○○"}
+    dots      = conf_dots.get(conf_str, "●○○○○")
 
-    # Reason breakdown
-    with st.expander("Signal breakdown", expanded=True):
-        for kind, txt in signal["reasons"]:
-            icons = {"bull": "🟢", "bear": "🔴", "warn": "🟡", "info": "🔵"}
-            st.markdown(f"{icons.get(kind, '•')} {txt}")
+    # Score bar
+    max_score  = 6
+    score_pct  = min(abs(score) / max_score * 100, 100)
+    score_fill = int(score_pct / 10)
+    score_bar  = "█" * score_fill + "░" * (10 - score_fill)
 
+    # Window badge
+    window_badge = (
+        '<span style="background:#ff6d00;color:white;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;">🔥 HOT WINDOW</span>'
+        if _high_vol else
+        '<span style="background:#37474f;color:#ccc;padding:2px 8px;border-radius:4px;font-size:12px;">❄️ CALM WINDOW</span>'
+    )
+
+    # Target / SL
+    tgt = f"{signal['target']:,.0f}" if signal["target"] else "--"
+    sl  = f"{signal['stop_loss']:,.0f}" if signal["stop_loss"] else "--"
+
+    # Reason pills
+    icons = {"bull": "🟢", "bear": "🔴", "warn": "🟡", "info": "🔵"}
+    reason_html = "".join(
+        f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0;font-size:13px;">'
+        f'<span>{icons.get(k,"•")}</span><span style="color:#ddd;">{t}</span></div>'
+        for k, t in signal["reasons"]
+    )
+
+    if direction in ("CE", "PE") and rec_ltp:
+        card_html = f"""
+<div style="
+    background:{bg_color};
+    border:2px solid {border_col};
+    border-radius:12px;
+    padding:20px 24px;
+    margin-bottom:16px;
+">
+    <!-- Header row -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+        <div>
+            <div style="font-size:13px;color:#aaa;font-weight:500;letter-spacing:0.08em;text-transform:uppercase;">
+                Best Option to Buy Now
+            </div>
+            <div style="font-size:28px;font-weight:700;color:{label_col};margin-top:2px;">
+                {rec_strike:,} {opt_type} &nbsp;
+                <span style="font-size:16px;background:{border_col};color:white;
+                    padding:3px 10px;border-radius:6px;vertical-align:middle;">
+                    {rec}
+                </span>
+            </div>
+        </div>
+        <div style="text-align:right;">
+            {window_badge}
+            <div style="margin-top:8px;font-size:13px;color:#aaa;">
+                Confidence &nbsp;<span style="color:{label_col};font-size:15px;letter-spacing:2px;">{dots}</span>
+                &nbsp; <b style="color:{label_col};">{conf_str}</b>
+            </div>
+            <div style="font-size:12px;color:#888;margin-top:4px;">
+                Signal score &nbsp; <span style="font-family:monospace;color:{label_col};">{score_bar}</span>
+                &nbsp; {score:+d}/6
+            </div>
+        </div>
+    </div>
+
+    <!-- Key numbers row -->
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px;">
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Premium</div>
+            <div style="font-size:18px;font-weight:600;color:white;">Rs.{rec_ltp:,.2f}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Buyer Margin</div>
+            <div style="font-size:18px;font-weight:600;color:white;">{fmt_inr(rec_margin)}</div>
+            <div style="font-size:10px;color:#888;">{rec_ltp:.1f} x {conf["lot_size"]} x {lots}L</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Entry Spot</div>
+            <div style="font-size:18px;font-weight:600;color:white;">{spot:,.0f}</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Target</div>
+            <div style="font-size:18px;font-weight:600;color:#00e676;">{tgt}</div>
+            <div style="font-size:10px;color:#888;">+15 pts on spot</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Stop-Loss</div>
+            <div style="font-size:18px;font-weight:600;color:#ff5252;">{sl}</div>
+            <div style="font-size:10px;color:#888;">-7.5 pts on spot</div>
+        </div>
+        <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
+            <div style="font-size:11px;color:#aaa;text-transform:uppercase;">R:R Ratio</div>
+            <div style="font-size:18px;font-weight:600;color:white;">2 : 1</div>
+            <div style="font-size:10px;color:#888;">15 tgt / 7.5 sl</div>
+        </div>
+    </div>
+
+    <!-- Greeks mini row -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px;">
+        <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px;font-size:13px;">
+            <span style="color:#888;">Delta</span>
+            <span style="color:white;font-weight:600;float:right;">{rec_delta}</span>
+        </div>
+        <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px;font-size:13px;">
+            <span style="color:#888;">Theta/day</span>
+            <span style="color:#ff5252;font-weight:600;float:right;">{rec_theta}</span>
+        </div>
+        <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px;font-size:13px;">
+            <span style="color:#888;">IV</span>
+            <span style="color:white;font-weight:600;float:right;">{rec_iv:.1f}%</span>
+        </div>
+    </div>
+
+    <!-- Signal reasons -->
+    <div style="border-top:1px solid rgba(255,255,255,0.1);padding-top:12px;">
+        <div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:6px;">
+            Why this signal
+        </div>
+        {reason_html}
+    </div>
+</div>
+"""
+    else:
+        # WAIT / AVOID card
+        card_html = f"""
+<div style="
+    background:{bg_color};
+    border:2px solid {border_col};
+    border-radius:12px;
+    padding:20px 24px;
+    margin-bottom:16px;
+">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+            <div style="font-size:13px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">
+                Best Option to Buy Now
+            </div>
+            <div style="font-size:26px;font-weight:700;color:{label_col};margin-top:4px;">
+                {signal["emoji"]} {rec}
+            </div>
+            <div style="font-size:13px;color:#aaa;margin-top:6px;">
+                Score {score:+d}/6 — indicators are mixed, no clear edge right now
+            </div>
+        </div>
+        <div>{window_badge}</div>
+    </div>
+    <div style="border-top:1px solid rgba(255,255,255,0.1);padding-top:12px;margin-top:12px;">
+        {reason_html}
+    </div>
+</div>
+"""
+
+    st.markdown(card_html, unsafe_allow_html=True)
     st.divider()
 
 elif run_live and not indicators:
-    st.info("Waiting for candle data to generate signal... (fetched every 60s)")
+    st.markdown("""
+<div style="background:#1a1a2e;border:1px solid #444;border-radius:10px;padding:16px 20px;margin-bottom:16px;">
+    <div style="font-size:13px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">Best Option to Buy Now</div>
+    <div style="font-size:18px;color:#ffd740;margin-top:6px;">⏳ Waiting for candle data...</div>
+    <div style="font-size:13px;color:#888;margin-top:4px;">Candles are fetched every 60s. Signal will appear shortly after the first fetch.</div>
+</div>
+""", unsafe_allow_html=True)
+    st.divider()
 
 # ==============================================================
 # 20. TOP METRICS

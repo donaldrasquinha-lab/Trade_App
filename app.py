@@ -1,4 +1,11 @@
 import streamlit as st
+st.write("Available Secret Keys:", list(st.secrets.keys()))
+if "upstox" in st.secrets:
+    st.write("Upstox Keys:", list(st.secrets["upstox"].keys()))
+
+
+
+import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import norm

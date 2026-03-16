@@ -903,13 +903,15 @@ if ce_data and ce_data.get("ce_delta"):
             "gamma": round(pe_data["pe_gamma"], 6), "vega":  round(pe_data["pe_vega"],  2),
             "iv":    round(pe_data["pe_iv"], 2)}
     greeks_source = "Exchange"
-elif spot and atm:
+elif spot and atm and ce_strike and pe_strike:
+    # Always compute BS Greeks when we have spot — never leave g_ce as None
     g_ce = bs_greeks(spot, ce_strike, dte, r, iv, "call"); g_ce["iv"] = iv_pct
     g_pe = bs_greeks(spot, pe_strike, dte, r, iv, "put");  g_pe["iv"] = iv_pct
     greeks_source = "BS Model"
 else:
-    g_ce = g_pe = None
-    greeks_source = "--"
+    g_ce = {"delta": 0.5, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "iv": iv_pct}
+    g_pe = {"delta":-0.5, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "iv": iv_pct}
+    greeks_source = "Estimated"
 
 
 # ==============================================================
@@ -1154,9 +1156,18 @@ pe_snr = {"support": [], "resistance": [], "current": pe_ltp or 0}
 
 if ce_ltp and ce_ltp > 0:
     ce_snr = option_snr(ce_ltp, iv_pct, dte_days, candle_df)
+elif spot and ce_strike:
+    # Estimate ATM option price via BS when chain not yet loaded
+    _ce_est = bs_greeks(spot, ce_strike, dte, r, iv, "call")
+    # Rough premium estimate: intrinsic + time value
+    _ce_ltp_est = max(round(spot * iv * (dte_days / 365) ** 0.5 * 0.4, 1), 5.0)
+    ce_snr = option_snr(_ce_ltp_est, iv_pct, dte_days, candle_df)
 
 if pe_ltp and pe_ltp > 0:
     pe_snr = option_snr(pe_ltp, iv_pct, dte_days, candle_df)
+elif spot and pe_strike:
+    _pe_ltp_est = max(round(spot * iv * (dte_days / 365) ** 0.5 * 0.4, 1), 5.0)
+    pe_snr = option_snr(_pe_ltp_est, iv_pct, dte_days, candle_df)
 
 # ==============================================================
 # 17. GENERATE SIGNAL
@@ -1568,7 +1579,7 @@ def build_snr_html(snr, ltp, label_col, tf_label):
     html += "</div></div>"
     return html
 
-if spot and atm and g_ce and g_pe:
+if spot and atm:
     col_ce, col_pe = st.columns(2)
 
     with col_ce:

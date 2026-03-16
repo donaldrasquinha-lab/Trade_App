@@ -39,25 +39,33 @@ except Exception:
 
 # ==============================================================
 # 3. INDEX METADATA
+#
+#    instrument_key   -- sent TO the API  (pipe separator)
+#    response_key     -- returned BY the API (colon separator)
+#    Both are stored so we can match response data correctly.
 # ==============================================================
 INDEX_CONFIG = {
     "NIFTY 50": {
         "instrument_key": "NSE_INDEX|Nifty 50",
+        "response_key":   "NSE_INDEX:Nifty 50",
         "lot_size": 75,
         "strike_step": 50,
     },
     "BANK NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Bank",
+        "response_key":   "NSE_INDEX:Nifty Bank",
         "lot_size": 30,
         "strike_step": 100,
     },
     "FINNIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Fin Service",
+        "response_key":   "NSE_INDEX:Nifty Fin Service",
         "lot_size": 65,
         "strike_step": 50,
     },
     "MIDCAP NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Midcap Select",
+        "response_key":   "NSE_INDEX:Nifty Midcap Select",
         "lot_size": 120,
         "strike_step": 25,
     },
@@ -72,17 +80,13 @@ if "token_ok"    not in st.session_state: st.session_state.token_ok    = None
 if "token_msg"   not in st.session_state: st.session_state.token_msg   = ""
 if "live_feed"   not in st.session_state: st.session_state.live_feed   = False
 if "last_prices" not in st.session_state: st.session_state.last_prices = {}
-if "show_debug"  not in st.session_state: st.session_state.show_debug  = True
 
 # ==============================================================
-# 5. PRICE FETCH  (with full debug output)
+# 5. PRICE FETCH
+#    API returns data as plain dicts with colon-separated keys.
+#    e.g. { "NSE_INDEX:Nifty 50": {"last_price": 22400, "ohlc": {...}} }
 # ==============================================================
-def fetch_all_prices(token, debug=False):
-    """
-    Fetches LTP for all indices via REST.
-    Returns (prices_dict, error_string_or_None).
-    If debug=True writes raw response into st.sidebar.
-    """
+def fetch_all_prices(token):
     try:
         conf = upstox_client.Configuration()
         conf.access_token = token
@@ -91,42 +95,19 @@ def fetch_all_prices(token, debug=False):
         keys_str = ",".join(ALL_INSTRUMENT_KEYS)
         res = api.get_market_quote_ohlc(keys_str, "1d", "2.0")
 
-        if debug:
-            st.sidebar.markdown("**Raw API response:**")
-            st.sidebar.write(f"status: `{res.status}`")
-            st.sidebar.write(f"data type: `{type(res.data)}`")
-            if res.data:
-                st.sidebar.write(f"data keys: `{list(res.data.keys())}`")
-                # Show full first item so we can see field names
-                first_key = list(res.data.keys())[0]
-                first_val = res.data[first_key]
-                st.sidebar.write(f"first key: `{first_key}`")
-                st.sidebar.write(f"first value: `{first_val}`")
-                # Try common field names
-                for attr in ["last_price", "ltp", "close_price", "ohlc",
-                             "last_traded_price", "avg_price"]:
-                    val = getattr(first_val, attr, "NOT FOUND")
-                    st.sidebar.write(f"  .{attr} = `{val}`")
-            else:
-                st.sidebar.write("data is None or empty")
-
         prices = {}
         if res.status == "success" and res.data:
-            for ikey, quote in res.data.items():
-                # Try all possible LTP field names
-                ltp = (getattr(quote, "last_price",        None) or
-                       getattr(quote, "ltp",               None) or
-                       getattr(quote, "last_traded_price", None))
-
-                # Try all possible close field names
-                ohlc  = getattr(quote, "ohlc", None)
-                close = None
-                if ohlc:
-                    close = (getattr(ohlc, "close", None) or
-                             getattr(ohlc, "close_price", None))
-                if close is None:
-                    close = (getattr(quote, "close_price", None) or
-                             getattr(quote, "prev_close",  None))
+            for response_key, quote in res.data.items():
+                # quote is a plain dict
+                if isinstance(quote, dict):
+                    ltp  = quote.get("last_price")
+                    ohlc = quote.get("ohlc", {})
+                    close = ohlc.get("close") if isinstance(ohlc, dict) else None
+                else:
+                    # fallback: object with attributes
+                    ltp   = getattr(quote, "last_price", None)
+                    ohlc  = getattr(quote, "ohlc", None)
+                    close = ohlc.get("close") if isinstance(ohlc, dict) else getattr(ohlc, "close", None)
 
                 if ltp is None:
                     continue
@@ -135,7 +116,7 @@ def fetch_all_prices(token, debug=False):
                 close = float(close) if close else ltp
                 change_pct = round(((ltp - close) / close) * 100, 2) if close else 0.0
 
-                prices[ikey] = {
+                prices[response_key] = {
                     "ltp":        ltp,
                     "close":      close,
                     "change_pct": change_pct,
@@ -251,30 +232,20 @@ with st.sidebar:
     st.divider()
     st.caption("Market hours: 9:15 AM - 3:30 PM IST, Mon-Fri")
 
-    # Debug toggle -- leave ON until prices are confirmed working
-    st.divider()
-    show_debug = st.toggle("Show Debug Info", value=True, key="show_debug")
-
 # ==============================================================
 # 9. FETCH PRICES
 # ==============================================================
 fetch_error = None
 
 if run_live:
-    prices, fetch_error = fetch_all_prices(TOKEN, debug=show_debug)
+    prices, fetch_error = fetch_all_prices(TOKEN)
     if prices:
         st.session_state.last_prices = prices
-else:
-    prices = {}
-
-# Show fetch error prominently if present
-if fetch_error:
-    st.sidebar.error(f"Fetch error: {fetch_error}")
 
 # Use last known prices if current fetch empty
 all_prices = st.session_state.last_prices
-ikey       = conf["instrument_key"]
-feed_entry = all_prices.get(ikey)
+rkey       = conf["response_key"]       # colon-format key to look up in response
+feed_entry = all_prices.get(rkey)
 
 if feed_entry:
     spot       = feed_entry["ltp"]
@@ -291,18 +262,18 @@ st.markdown(f"# {selected_index} Scalper")
 h1, h2, h3 = st.columns([2, 2, 3])
 with h1:
     if run_live and fetch_error:
-        st.caption(f"🔴 API error")
+        st.caption(f"🔴 API error: {fetch_error}")
     elif run_live and spot:
-        st.caption("🟢 REST feed live")
+        st.caption("🟢 Live")
     elif run_live:
-        st.caption("🟡 Fetching... (market may be closed)")
+        st.caption("🟡 Fetching...")
     else:
-        st.caption("⚪ Paused -- toggle Live Feed to start")
+        st.caption("⚪ Paused")
 with h2:
     if data_age is not None:
-        st.caption(f"Last update: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
+        st.caption(f"Updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
 with h3:
-    st.caption(f"Instrument: `{ikey}`")
+    st.caption(f"Instrument: `{conf['instrument_key']}`")
 
 st.divider()
 
@@ -417,7 +388,7 @@ if run_live and all_prices:
     st.markdown("### All Index Prices")
     rows = []
     for idx_name, idx_conf in INDEX_CONFIG.items():
-        entry = all_prices.get(idx_conf["instrument_key"])
+        entry = all_prices.get(idx_conf["response_key"])
         if entry:
             rows.append({
                 "Index":       idx_name,

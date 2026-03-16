@@ -49,7 +49,7 @@ api_instance = get_api_instance(TOKEN)
 while True:
     try:
         # EXACT CASE SENSITIVE KEY REQUIRED
-        instrument_key = "NSE_INDEX|Nifty 50" 
+        instrument_key = "NSE_INDEX:Nifty 50" 
         
         # Use api_version '2.0' as required by v2 SDK
         api_response = api_instance.ltp(instrument_key, '2.0')

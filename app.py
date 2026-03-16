@@ -123,13 +123,21 @@ def get_dte(expiry_weekday):
     return (expiry_date - today).days, expiry_date
 
 def get_refresh_ms():
+    """
+    Returns refresh interval in ms during market hours, None outside.
+    Market hours: Mon-Fri 9:15 AM - 3:30 PM IST
+    Returns None = no auto-refresh (market closed)
+    """
     now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    # Weekend check
+    if now_ist.weekday() >= 5:   # Saturday=5, Sunday=6
+        return None
     t = now_ist.hour * 60 + now_ist.minute
+    if t < 555 or t > 930:       # before 9:15 AM or after 3:30 PM
+        return None
     if 555 <= t <= 570 or 870 <= t <= 930:
-        return 1000
-    elif 555 <= t <= 930:
-        return 2000
-    return 3000
+        return 1000   # fast: open / close volatility windows
+    return 2000       # normal: midday
 
 def fmt_inr(v):
     if v >= 1e7: return f"Rs.{v/1e7:.2f} Cr"
@@ -1088,7 +1096,10 @@ with st.sidebar:
     r         = risk_free / 100.0
 
     st.divider()
-    st.caption(f"Refresh: {_refresh}ms  |  Window: {'🔥 Hot' if _high_vol else '❄️ Calm'}")
+    if _refresh is not None:
+        st.caption(f"Refresh: {_refresh}ms  |  Window: {'🔥 Hot' if _high_vol else '❄️ Calm'}")
+    else:
+        st.caption("📴 Market closed — refresh paused")
 
     st.divider()
     st.markdown("### Connection")
@@ -2537,8 +2548,32 @@ if not run_live:
     st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
-# 26. AUTO-REFRESH
+# 26. AUTO-REFRESH  (market hours only, seamless via st.fragment)
 # ==============================================================
 if run_live:
-    time.sleep(_refresh / 1000)
-    st.rerun()
+    if _refresh is not None:
+        # Market is open — seamless auto-refresh using st.rerun(scope="fragment")
+        # Falls back to full rerun if fragment scope not supported (older Streamlit)
+        time.sleep(_refresh / 1000)
+        try:
+            st.rerun(scope="fragment")
+        except TypeError:
+            st.rerun()
+    else:
+        # Market is closed — show status, no refresh loop
+        now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        wd      = now_ist.weekday()
+        t       = now_ist.hour * 60 + now_ist.minute
+
+        if wd >= 5:
+            next_open = "Monday 9:15 AM IST"
+        elif t < 555:
+            next_open = f"Today at 9:15 AM IST ({555 - t} min)"
+        else:
+            next_open = "Tomorrow at 9:15 AM IST"
+
+        st.info(
+            f"📴 Market closed — auto-refresh paused. "
+            f"Next open: **{next_open}**. "
+            f"Data shown is from last live session."
+        )

@@ -3,11 +3,12 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 import upstox_client
+from upstox_client.rest import ApiException
 import time
 
 # --- 1. SECRETS LOADING ---
 try:
-    # Ensure your .streamlit/secrets.toml has: [upstox] access_token = "..."
+    # TOML structure must be: [upstox] \n access_token = "..."
     TOKEN = st.secrets["upstox"]["access_token"]
 except Exception:
     st.error("Missing 'access_token' in .streamlit/secrets.toml")
@@ -26,7 +27,7 @@ def calculate_greeks(S, K, T, r, sigma, option_type="call"):
         theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) - 
                  r * K * np.exp(-r * T) * norm.cdf(d2))
     else:
-        delta = norm.cdf(d1) - 1
+        delta = norm.cdf(d1) - 1 # Corrected Put Delta (Negative)
         theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) + 
                  r * K * np.exp(-r * T) * norm.cdf(-d2))
         
@@ -37,7 +38,6 @@ def calculate_greeks(S, K, T, r, sigma, option_type="call"):
 def get_api_instance(token):
     config = upstox_client.Configuration()
     config.access_token = token
-    # Initialize the specific Market Quote API
     return upstox_client.MarketQuoteApi(upstox_client.ApiClient(config))
 
 # --- 4. UI LAYOUT ---
@@ -62,25 +62,23 @@ api_instance = get_api_instance(TOKEN)
 # --- 5. PERSISTENT LIVE LOOP ---
 while True:
     try:
-        # Correct Instrument Key for Nifty 50 Index
-        instrument_key = "NSE_INDEX|Nifty 50"
+        # EXACT CASE SENSITIVE KEY
+        instrument_key = "NSE_INDEX|Nifty 50" 
         
-        # FIX: Use .ltp() instead of .get_ltp() for MarketQuoteApi
-        # The version string must be 'v2' or '2.0' depending on SDK version
-        api_response = api_instance.ltp(instrument_key, 'v2')
+        # CORRECT SDK METHOD: .ltp(symbol, api_version)
+        api_response = api_instance.ltp(instrument_key, '2.0')
         
-        # Access data using dictionary key
-        quote_data = api_response.data[instrument_key]
-        spot = quote_data.last_price
-        
-        if spot:
+        # Accessing data safely
+        if instrument_key in api_response.data:
+            spot = api_response.data[instrument_key].last_price
+            
             # Calculate Strikes
             atm = int(round(spot / 50) * 50)
             ce_strike = atm - (offset * 50)
             pe_strike = atm + (offset * 50)
             
             with placeholder.container():
-                # Top Metrics
+                # Real-time Metrics
                 m1, m2, m3 = st.columns(3)
                 m1.metric("NIFTY 50 SPOT", f"₹{spot}")
                 m2.metric("NET EXPOSURE", f"₹{spot * lots * lot_size:,.0f}")
@@ -90,24 +88,26 @@ while True:
                 
                 # Trading Recommendations
                 c1, c2 = st.columns(2)
-                
                 with c1:
                     st.success(f"🟢 CALL: {ce_strike} CE")
-                    # Assuming 4 days to expiry, 7% risk-free rate, 15% IV
+                    # Assuming 4 days to expiry, 7% rate, 15% IV
                     g = calculate_greeks(spot, ce_strike, 4/365, 0.07, 0.15, "call")
                     st.write(f"**Delta:** `{g['delta']}` | **Theta:** `{g['theta']}`")
-                    st.caption(f"Target Entry: CMP | SL: {sl_pts} pts")
+                    st.caption(f"Strategy: Buy at CMP | SL: {sl_pts} pts")
 
                 with c2:
                     st.error(f"🔴 PUT: {pe_strike} PE")
                     g = calculate_greeks(spot, pe_strike, 4/365, 0.07, 0.15, "put")
                     st.write(f"**Delta:** `{g['delta']}` | **Theta:** `{g['theta']}`")
-                    st.caption(f"Target Entry: CMP | SL: {sl_pts} pts")
-                    
+                    st.caption(f"Strategy: Buy at CMP | SL: {sl_pts} pts")
+        else:
+            st.error(f"Instrument '{instrument_key}' not found. Check if market is closed.")
+            
+    except ApiException as e:
+        st.error(f"Upstox API Error: {e.body if hasattr(e, 'body') else e}")
+        break
     except Exception as e:
-        st.error(f"Error: {e}")
-        # If it's a 'NoneType' error, the market might be closed or symbol wrong
-        st.warning("Check if the market is open or your token is still valid.")
+        st.error(f"System Error: {e}")
         break
         
     time.sleep(2)

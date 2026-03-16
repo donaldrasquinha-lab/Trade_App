@@ -1,3 +1,5 @@
+import streamlit as st
+
 import streamlit as st  # MUST BE AT THE TOP
 import threading
 import time

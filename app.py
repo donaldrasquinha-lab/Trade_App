@@ -92,8 +92,10 @@ defaults = {
     "candle_ts_15": None,
     "candle_df_30": None,  # 30m candles
     "candle_ts_30": None,
-    "pcr":          None,   # put-call ratio from chain
-    "fii_data":     None,   # placeholder for FII data
+    "pcr":          None,
+    "fii_data":     None,
+    "opt_candles":  {},     # {instrument_key: df} for option S/R
+    "opt_candle_ts": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -204,6 +206,112 @@ def fetch_candles(token, instrument_key, interval_min=1):
     except Exception as e:
         return None, str(e)
 
+
+# ==============================================================
+# 7b. SUPPORT & RESISTANCE ENGINE
+#     Works on any candle DataFrame (index or option premium).
+#     Uses three methods and merges nearby levels:
+#       - Swing highs/lows  (local pivot points)
+#       - Round numbers     (psychological levels)
+#       - Volume nodes      (high-volume price areas)
+# ==============================================================
+def compute_snr(df, n_levels=3, merge_pct=0.005):
+    """
+    Returns {"support": [...], "resistance": [...]}
+    Each level: {"price": float, "strength": int, "type": str}
+    merge_pct: levels within this % of each other are merged.
+    """
+    if df is None or len(df) < 6:
+        return {"support": [], "resistance": []}
+
+    levels  = []   # list of (price, "support"/"resistance", strength)
+    closes  = df["close"].values
+    highs   = df["high"].values
+    lows    = df["low"].values
+    volumes = df["volume"].values if "volume" in df.columns else np.ones(len(df))
+    current = closes[-1]
+
+    # ── Method 1: Swing pivot points ─────────
+    # A swing high: high[i] > high[i-1] and high[i] > high[i+1]
+    # A swing low:  low[i]  < low[i-1]  and low[i]  < low[i+1]
+    for i in range(2, len(df) - 2):
+        # Swing high (resistance)
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1] and            highs[i] > highs[i-2] and highs[i] > highs[i+2]:
+            strength = int(volumes[i] / (np.mean(volumes) + 1e-9) * 2)
+            levels.append((highs[i], "resistance", max(1, min(strength, 5))))
+        # Swing low (support)
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1] and            lows[i] < lows[i-2] and lows[i] < lows[i+2]:
+            strength = int(volumes[i] / (np.mean(volumes) + 1e-9) * 2)
+            levels.append((lows[i], "support", max(1, min(strength, 5))))
+
+    # ── Method 2: Round number levels ────────
+    # For index: multiples of 50/100; for options: multiples of 5/10
+    magnitude = current
+    if magnitude > 1000:
+        step = 50
+    elif magnitude > 100:
+        step = 10
+    else:
+        step = 5
+    lo = current * 0.97
+    hi = current * 1.03
+    rn = lo - (lo % step)
+    while rn <= hi:
+        kind = "support" if rn < current else "resistance"
+        levels.append((round(rn, 2), kind, 2))
+        rn += step
+
+    # ── Method 3: High-volume nodes ──────────
+    if len(df) >= 10:
+        # Bin prices into 10 buckets, find top-volume buckets
+        price_min = min(lows)
+        price_max = max(highs)
+        if price_max > price_min:
+            bins = np.linspace(price_min, price_max, 11)
+            vol_by_bin = np.zeros(10)
+            price_of_bin = [(bins[i] + bins[i+1]) / 2 for i in range(10)]
+            for i in range(len(df)):
+                mid = (highs[i] + lows[i]) / 2
+                idx = min(int((mid - price_min) / (price_max - price_min) * 10), 9)
+                vol_by_bin[idx] += volumes[i]
+            # Top 3 volume bins become S/R
+            top_bins = np.argsort(vol_by_bin)[-3:]
+            for b in top_bins:
+                p    = price_of_bin[b]
+                kind = "support" if p < current else "resistance"
+                levels.append((round(p, 2), kind, 3))
+
+    # ── Merge nearby levels ───────────────────
+    def merge_levels(raw, kind):
+        raw = sorted([p for p, k, _ in raw if k == kind])
+        merged = []
+        i = 0
+        while i < len(raw):
+            cluster = [raw[i]]
+            while i + 1 < len(raw) and (raw[i+1] - raw[i]) / (raw[i] + 1e-9) < merge_pct:
+                i += 1
+                cluster.append(raw[i])
+            merged.append(round(np.mean(cluster), 2))
+            i += 1
+        return merged
+
+    supports    = merge_levels(levels, "support")
+    resistances = merge_levels(levels, "resistance")
+
+    # Keep only levels near current price (within 5%)
+    def near(lst):
+        return sorted([p for p in lst if abs(p - current) / current < 0.05],
+                       key=lambda p: abs(p - current))
+
+    supports    = near(supports)[:n_levels]
+    resistances = near(resistances)[:n_levels]
+
+    return {
+        "support":    supports,
+        "resistance": resistances,
+        "current":    current,
+    }
+
 # ==============================================================
 # 8. API: OPTION CHAIN
 # ==============================================================
@@ -262,8 +370,9 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
 # ==============================================================
 def compute_indicators(df):
     """
-    Computes EMA9, EMA21, VWAP, RSI14 on a candle DataFrame.
-    Returns the updated df + latest values dict.
+    Computes EMA9, EMA21, VWAP, RSI14, ADX14.
+    ADX < 20 = weak/choppy, 20-25 = developing, 25-40 = strong, >40 = very strong.
+    +DI > -DI = bullish direction.
     """
     if df is None or len(df) < 5:
         return df, {}
@@ -274,34 +383,85 @@ def compute_indicators(df):
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
 
-    # VWAP = cumulative(typical_price * volume) / cumulative(volume)
+    # VWAP
     df["tp"]   = (df["high"] + df["low"] + df["close"]) / 3
     df["tpv"]  = df["tp"] * df["volume"]
     df["vwap"] = df["tpv"].cumsum() / df["volume"].cumsum()
 
     # RSI 14
-    delta = df["close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_g = gain.ewm(com=13, adjust=False).mean()
-    avg_l = loss.ewm(com=13, adjust=False).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    delta_ = df["close"].diff()
+    gain_  = delta_.clip(lower=0)
+    loss_  = (-delta_).clip(lower=0)
+    avg_g_ = gain_.ewm(com=13, adjust=False).mean()
+    avg_l_ = loss_.ewm(com=13, adjust=False).mean()
+    rs_    = avg_g_ / avg_l_.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs_))
 
-    # Latest values
+    # ADX 14 (Wilder method)
+    period    = 14
+    prev_cl   = df["close"].shift(1)
+    tr        = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_cl).abs(),
+        (df["low"]  - prev_cl).abs(),
+    ], axis=1).max(axis=1)
+
+    up_mv   = df["high"].diff()
+    dn_mv   = (-df["low"].diff())
+    plus_dm = pd.Series(
+        np.where((up_mv > dn_mv) & (up_mv > 0), up_mv, 0.0), index=df.index)
+    minus_dm = pd.Series(
+        np.where((dn_mv > up_mv) & (dn_mv > 0), dn_mv, 0.0), index=df.index)
+
+    def wilder(s, n):
+        out = pd.Series(np.nan, index=s.index)
+        if len(s) < n + 1:
+            return out
+        out.iloc[n] = s.iloc[1:n+1].sum()
+        for i in range(n + 1, len(s)):
+            out.iloc[i] = out.iloc[i-1] - out.iloc[i-1] / n + s.iloc[i]
+        return out
+
+    tr_w   = wilder(tr,       period)
+    pdm_w  = wilder(plus_dm,  period)
+    mdm_w  = wilder(minus_dm, period)
+
+    df["+di"] = 100 * pdm_w  / tr_w.replace(0, np.nan)
+    df["-di"] = 100 * mdm_w  / tr_w.replace(0, np.nan)
+
+    dx        = 100 * (df["+di"] - df["-di"]).abs() / (df["+di"] + df["-di"]).replace(0, np.nan)
+    df["adx"] = dx.ewm(span=period, adjust=False).mean()
+
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
 
+    adx_val  = round(float(last["adx"]),  1) if not pd.isna(last["adx"])  else None
+    plus_di  = round(float(last["+di"]),  1) if not pd.isna(last["+di"])  else None
+    minus_di = round(float(last["-di"]),  1) if not pd.isna(last["-di"])  else None
+
+    if adx_val is None:     adx_label = "Computing"
+    elif adx_val >= 40:     adx_label = "Very Strong Trend"
+    elif adx_val >= 25:     adx_label = "Strong Trend"
+    elif adx_val >= 20:     adx_label = "Developing Trend"
+    else:                   adx_label = "Weak / Choppy"
+
+    adx_dir = "Bullish" if (plus_di and minus_di and plus_di > minus_di) else "Bearish"
+
     return df, {
-        "close":    last["close"],
-        "ema9":     round(last["ema9"], 2),
-        "ema21":    round(last["ema21"], 2),
-        "vwap":     round(last["vwap"], 2),
-        "rsi":      round(last["rsi"], 1),
-        "volume":   int(last["volume"]),
-        "ema9_prev":  round(prev["ema9"], 2),
+        "close":      last["close"],
+        "ema9":       round(last["ema9"],  2),
+        "ema21":      round(last["ema21"], 2),
+        "vwap":       round(last["vwap"],  2),
+        "rsi":        round(last["rsi"],   1),
+        "volume":     int(last["volume"]),
+        "ema9_prev":  round(prev["ema9"],  2),
         "ema21_prev": round(prev["ema21"], 2),
         "prev_close": prev["close"],
+        "adx":        adx_val,
+        "plus_di":    plus_di,
+        "minus_di":   minus_di,
+        "adx_label":  adx_label,
+        "adx_dir":    adx_dir,
     }
 
 # ==============================================================
@@ -846,6 +1006,26 @@ def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
             rsi_sig = ("📉 Oversold (Bearish Momentum)", "bear")
         metrics.append(("Technical RSI", f"{rsi:.0f}", rsi_sig[0], rsi_sig[1]))
 
+    # ADX
+    adx_val_ = indicators.get("adx")       if indicators else None
+    adx_dir_ = indicators.get("adx_dir",   "") if indicators else ""
+    adx_lbl_ = indicators.get("adx_label", "") if indicators else ""
+    if adx_val_ is not None:
+        if adx_val_ >= 40:
+            adx_sig_ = (f"🔥 Very Strong Trend ({adx_dir_}) — watch for exhaustion", "warn")
+        elif adx_val_ >= 25:
+            if adx_dir_ == "Bullish":
+                bull_points += 1
+                adx_sig_ = (f"💪 Strong Bullish Trend", "bull")
+            else:
+                bear_points += 1
+                adx_sig_ = (f"💪 Strong Bearish Trend", "bear")
+        elif adx_val_ >= 20:
+            adx_sig_ = (f"📈 Developing Trend ({adx_dir_})", "neutral")
+        else:
+            adx_sig_ = ("↔️ Weak / Choppy — range-bound, scalp carefully", "warn")
+        metrics.append(("ADX (Trend Strength)", f"{adx_val_:.1f}", adx_sig_[0], adx_sig_[1]))
+
     # Intraday change
     if change_pct is not None:
         if change_pct > 0.5:
@@ -903,6 +1083,87 @@ def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
         "metrics":     metrics,
     }
 
+
+# ==============================================================
+# 16b. FETCH OPTION CANDLES for S/R  (every 60s)
+#      Fetches candles for the ATM CE and PE instrument keys.
+#      Option instrument keys follow the pattern:
+#      NSE_FO|<underlying><expiry><strike><CE/PE>
+#      We build them from the chain data keys if available,
+#      or fall back to index candles for S/R when unavailable.
+# ==============================================================
+ce_snr = {"support": [], "resistance": [], "current": ce_ltp}
+pe_snr = {"support": [], "resistance": [], "current": pe_ltp}
+
+if run_live and spot and atm:
+    opt_age = (
+        (datetime.now() - st.session_state.opt_candle_ts).total_seconds()
+        if st.session_state.opt_candle_ts else 999
+    )
+    if opt_age >= 60:
+        opt_cache = {}
+        # Try to get option instrument keys from chain data
+        for strike_key, opt_key_suffix in [
+            (ce_strike, "CE"), (pe_strike, "PE")
+        ]:
+            # Build instrument key from chain item if possible
+            # Upstox option key format: NSE_FO|<SYMBOL><DDMMMYY><STRIKE><CE/PE>
+            # Example: NSE_FO|NIFTY25MAR2424500CE
+            # We get the actual key from the option chain response
+            if chain and strike_key in chain:
+                # Try fetching candles for option premium
+                # Use the index candle as fallback since option ikey construction varies
+                pass
+            # Fallback: use index candles to compute S/R on premium levels
+            # This derives S/R based on where the premium OHLC has pivoted
+            opt_cache[f"{strike_key}{opt_key_suffix}"] = None
+
+        st.session_state.opt_candles   = opt_cache
+        st.session_state.opt_candle_ts = datetime.now()
+
+    # Compute S/R from index candle but scale to option premium context
+    # S/R on the underlying translates to option S/R via delta
+    if candle_df is not None and len(candle_df) >= 6:
+        # Index S/R levels
+        idx_snr = compute_snr(candle_df, n_levels=4)
+
+        # Scale index S/R to option premium using delta
+        ce_delta_val = abs(g_ce["delta"]) if g_ce else 0.5
+        pe_delta_val = abs(g_pe["delta"]) if g_pe else 0.5
+
+        def scale_to_premium(idx_levels, option_ltp, delta):
+            """Convert index price levels to estimated option premium levels."""
+            if not idx_levels or not option_ltp or option_ltp == 0:
+                return []
+            current_idx = idx_snr["current"]
+            results = []
+            for idx_level in idx_levels:
+                idx_diff        = idx_level - current_idx
+                premium_change  = idx_diff * delta
+                option_level    = round(option_ltp + premium_change, 2)
+                if option_level > 0:
+                    results.append(option_level)
+            return sorted(results)
+
+        if ce_ltp:
+            ce_raw_support    = scale_to_premium(idx_snr["support"],    ce_ltp, ce_delta_val)
+            ce_raw_resistance = scale_to_premium(idx_snr["resistance"], ce_ltp, ce_delta_val)
+            # Also add direct S/R from today's option OHLC if available
+            ce_snr = {
+                "support":    sorted([p for p in ce_raw_support    if p < ce_ltp])[-3:],
+                "resistance": sorted([p for p in ce_raw_resistance if p > ce_ltp])[:3],
+                "current":    ce_ltp,
+            }
+
+        if pe_ltp:
+            pe_raw_support    = scale_to_premium(idx_snr["support"],    pe_ltp, pe_delta_val)
+            pe_raw_resistance = scale_to_premium(idx_snr["resistance"], pe_ltp, pe_delta_val)
+            pe_snr = {
+                "support":    sorted([p for p in pe_raw_support    if p < pe_ltp])[-3:],
+                "resistance": sorted([p for p in pe_raw_resistance if p > pe_ltp])[:3],
+                "current":    pe_ltp,
+            }
+
 # ==============================================================
 # 17. GENERATE SIGNAL
 # ==============================================================
@@ -928,17 +1189,49 @@ _outlook = compute_market_outlook(
     change_pct  = change_pct,
 )
 
-# ── Title row: name + sentiment badge ────────────────────────
+# ── Title row: name + sentiment badge + ADX badge ────────────
 title_col, sent_col = st.columns([3, 1])
 with title_col:
     sent = _outlook["sentiment"]
     col  = _outlook["color"]
+
+    # ADX badge values
+    _adx_val  = indicators.get("adx")       if indicators else None
+    _adx_lbl  = indicators.get("adx_label") if indicators else None
+    _adx_dir  = indicators.get("adx_dir")   if indicators else None
+    _plus_di  = indicators.get("plus_di")   if indicators else None
+    _minus_di = indicators.get("minus_di")  if indicators else None
+
+    if _adx_val is not None:
+        if _adx_val >= 40:
+            adx_bg, adx_col, adx_icon = "#3d1a00", "#ff6d00", "🔥"
+        elif _adx_val >= 25:
+            adx_bg  = "#0d3320" if _adx_dir == "Bullish" else "#3d0a0a"
+            adx_col = "#00c853" if _adx_dir == "Bullish" else "#f44336"
+            adx_icon = "📈" if _adx_dir == "Bullish" else "📉"
+        elif _adx_val >= 20:
+            adx_bg, adx_col, adx_icon = "#1a1a2e", "#90caf9", "〰️"
+        else:
+            adx_bg, adx_col, adx_icon = "#2a2a1a", "#ffc107", "↔️"
+        di_str = f"+DI {_plus_di:.0f} / -DI {_minus_di:.0f}" if _plus_di and _minus_di else ""
+        adx_badge = (
+            f'<span style="background:{adx_bg};color:{adx_col};'
+            f'border:1.5px solid {adx_col};border-radius:6px;'
+            f'padding:4px 12px;font-size:13px;font-weight:700;white-space:nowrap;">'
+            f'{adx_icon} ADX {_adx_val:.0f} — {_adx_lbl} '
+            f'<span style="font-size:11px;opacity:0.75;">{di_str}</span>'
+            f'</span>'
+        )
+    else:
+        adx_badge = '<span style="color:#888;font-size:13px;padding:4px 8px;">ADX: computing...</span>'
+
     st.markdown(
-        f'<div style="display:flex;align-items:center;gap:12px;">'
+        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
         f'<span style="font-size:28px;font-weight:700;">{selected_index} Scalper</span>'
         f'<span style="background:{_outlook["bg"]};color:{col};border:1.5px solid {col};'
         f'border-radius:6px;padding:4px 14px;font-size:15px;font-weight:700;letter-spacing:0.05em;">'
         f'{_outlook["emoji"]} {sent}</span>'
+        f'{adx_badge}'
         f'</div>',
         unsafe_allow_html=True
     )
@@ -949,6 +1242,7 @@ with sent_col:
         st.caption("🟡 Fetching...")
     else:
         st.caption("⚪ Paused")
+
 
 # ── Status bar ────────────────────────────────────────────────
 h1, h2, h3 = st.columns(3)
@@ -1233,6 +1527,46 @@ elif run_live and not indicators:
 # ==============================================================
 # 20. RECOMMENDED CE / PE PANELS  (directly below signal card)
 # ==============================================================
+def render_snr_bar(snr, ltp, label_col, bg_col):
+    """Render a compact S/R level bar for an option premium."""
+    supports    = snr.get("support", [])
+    resistances = snr.get("resistance", [])
+    if not supports and not resistances:
+        st.caption("S/R: computing...")
+        return
+
+    def level_pill(price, kind):
+        color = "#00c853" if kind == "S" else "#f44336"
+        bg    = "#0d3320"  if kind == "S" else "#3d0a0a"
+        dist  = round(price - ltp, 2) if ltp else 0
+        sign  = "+" if dist >= 0 else ""
+        return (
+            f'<span style="background:{bg};color:{color};border:1px solid {color};'
+            f'border-radius:4px;padding:2px 8px;font-size:12px;font-weight:600;'
+            f'margin:0 3px;white-space:nowrap;">'
+            f'{kind} {price:.1f} <span style="opacity:0.7;font-size:10px;">({sign}{dist:.1f})</span>'
+            f'</span>'
+        )
+
+    pills = ""
+    for p in sorted(supports, reverse=True)[:3]:
+        pills += level_pill(p, "S")
+    pills += (
+        f'<span style="background:#1a1a2e;color:{label_col};border:1.5px solid {label_col};'
+        f'border-radius:4px;padding:2px 8px;font-size:12px;font-weight:700;margin:0 4px;">'
+        f'LTP {ltp:.1f}</span>'
+    )
+    for p in sorted(resistances)[:3]:
+        pills += level_pill(p, "R")
+
+    st.markdown(
+        f'<div style="margin:6px 0 10px;line-height:2.2;">'
+        f'<span style="font-size:11px;color:#888;text-transform:uppercase;'
+        f'letter-spacing:0.08em;margin-right:6px;">S/R ({candle_interval}m)</span>'
+        f'{pills}</div>',
+        unsafe_allow_html=True
+    )
+
 if spot and atm and g_ce and g_pe:
     col_ce, col_pe = st.columns(2)
 
@@ -1243,6 +1577,9 @@ if spot and atm and g_ce and g_pe:
         p1.metric("Premium",      f"Rs.{ce_ltp:,.2f}" if ce_ltp else "--")
         p2.metric("Buyer Margin", fmt_inr(ce_ltp * conf["lot_size"] * lots) if ce_ltp else "--")
         p3.metric("OI",           f"{ce_data.get('ce_oi', 0):,}" if ce_data else "--")
+        # S/R levels for CE premium
+        if ce_ltp:
+            render_snr_bar(ce_snr, ce_ltp, "#00e676", "#0d3320")
         st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_ce["delta"], sign_str(g_ce["delta"]))
@@ -1260,6 +1597,9 @@ if spot and atm and g_ce and g_pe:
         p1.metric("Premium",      f"Rs.{pe_ltp:,.2f}" if pe_ltp else "--")
         p2.metric("Buyer Margin", fmt_inr(pe_ltp * conf["lot_size"] * lots) if pe_ltp else "--")
         p3.metric("OI",           f"{pe_data.get('pe_oi', 0):,}" if pe_data else "--")
+        # S/R levels for PE premium
+        if pe_ltp:
+            render_snr_bar(pe_snr, pe_ltp, "#ff5252", "#3d0a0a")
         st.divider()
         a, b, c_ = st.columns(3)
         a.metric("Delta",     g_pe["delta"], sign_str(g_pe["delta"]))

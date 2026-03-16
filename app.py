@@ -1510,8 +1510,8 @@ with hc2:
         st.markdown(
             f'<div style="padding-top:2px;">'
             f'<div style="font-size:11px;color:#888;text-transform:uppercase;'
-            f'letter-spacing:0.08em;margin-bottom:2px;">Spot Price</div>'
-            f'<div style="font-size:28px;font-weight:700;color:white;line-height:1.1;">'
+            f'letter-spacing:0.08em;margin-bottom:2px;color:#000000;">Spot Price</div>'
+            f'<div style="font-size:28px;font-weight:700;color:#000000;line-height:1.1;">'
             f'Rs.{spot:,.2f}</div>'
             f'<div style="font-size:13px;margin-top:2px;">'
             f'<span style="color:{_chg_col};font-weight:600;">{_chg_str}</span>'
@@ -1567,19 +1567,19 @@ with st.expander("📊 Market Outlook Summary", expanded=True):
             fg, bg = color_map.get(kind, ("#ccc", "#1a1a1a"))
             rows_html += (
                 f'<tr>'
-                f'<td style="padding:8px 12px;color:#ccc;border-bottom:1px solid #333;">{metric}</td>'
-                f'<td style="padding:8px 12px;color:white;font-weight:600;border-bottom:1px solid #333;">{value}</td>'
+                f'<td style="padding:8px 12px;color:#333333;font-weight:500;border-bottom:1px solid #ddd;">{metric}</td>'
+                f'<td style="padding:8px 12px;color:#000000;font-weight:700;border-bottom:1px solid #333;">{value}</td>'
                 f'<td style="padding:8px 12px;border-bottom:1px solid #333;">'
                 f'<span style="background:{bg};color:{fg};padding:3px 10px;border-radius:4px;font-size:13px;">'
                 f'{signal_txt}</span></td>'
                 f'</tr>'
             )
         table_html = (
-            f'<table style="width:100%;border-collapse:collapse;font-size:14px;">'
+            f'<table style="width:100%;border-collapse:collapse;font-size:14px;background:white;border-radius:8px;">'
             f'<thead><tr>'
-            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Metric</th>'
-            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Current Value</th>'
-            f'<th style="padding:8px 12px;text-align:left;color:#888;font-weight:500;border-bottom:1px solid #444;">Sentiment Signal</th>'
+            f'<th style="padding:8px 12px;text-align:left;color:#000;font-weight:700;border-bottom:2px solid #333;">Metric</th>'
+            f'<th style="padding:8px 12px;text-align:left;color:#000;font-weight:700;border-bottom:2px solid #333;">Current Value</th>'
+            f'<th style="padding:8px 12px;text-align:left;color:#000;font-weight:700;border-bottom:2px solid #333;">Sentiment Signal</th>'
             f'</tr></thead>'
             f'<tbody>{rows_html}</tbody>'
             f'</table>'

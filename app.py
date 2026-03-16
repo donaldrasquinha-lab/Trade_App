@@ -86,6 +86,8 @@ defaults = {
     "last_vix":    None,
     "last_chain":  {},
     "chain_ts":    None,
+    "prev_chain":  {},     # chain snapshot 30s ago for OI momentum
+    "prev_chain_ts": None,
     "candle_ts":   None,
     "candle_df":   None,   # primary timeframe candles
     "candle_df_15": None,  # 15m candles
@@ -365,6 +367,151 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
     except Exception as e:
         return {}, str(e)
 
+
+# ==============================================================
+# OI MOMENTUM ENGINE
+# Compares current vs previous chain OI to determine:
+#   Long Buildup   : Price↑ + OI↑  → Buy CE
+#   Short Buildup  : Price↓ + OI↑  → Buy PE
+#   Short Covering : Price↑ + OI↓  → Caution (exit PE)
+#   Long Unwinding : Price↓ + OI↓  → Caution (exit CE)
+# Also finds max OI strikes (support/resistance walls)
+# ==============================================================
+def compute_oi_momentum(chain, prev_chain, current_price, prev_price):
+    """
+    Returns OI momentum analysis dict.
+    chain / prev_chain : {strike: {ce_oi, pe_oi, ce_ltp, pe_ltp, ...}}
+    current_price / prev_price : float
+    """
+    if not chain:
+        return None
+
+    # ── Total OI change ──────────────────────────────────────
+    total_ce_oi_now  = sum(v.get("ce_oi", 0) for v in chain.values())
+    total_pe_oi_now  = sum(v.get("pe_oi", 0) for v in chain.values())
+    total_ce_oi_prev = sum(v.get("ce_oi", 0) for v in prev_chain.values()) if prev_chain else total_ce_oi_now
+    total_pe_oi_prev = sum(v.get("pe_oi", 0) for v in prev_chain.values()) if prev_chain else total_pe_oi_now
+
+    ce_oi_change = total_ce_oi_now - total_ce_oi_prev
+    pe_oi_change = total_pe_oi_now - total_pe_oi_prev
+
+    # Determine dominant OI momentum
+    total_oi_now  = total_ce_oi_now  + total_pe_oi_now
+    total_oi_prev = total_ce_oi_prev + total_pe_oi_prev
+    oi_rising     = total_oi_now > total_oi_prev
+
+    price_rising  = (current_price > prev_price) if prev_price else None
+
+    # ── Decision matrix ──────────────────────────────────────
+    if price_rising is True  and oi_rising:
+        scenario     = "Long Buildup"
+        decision     = "BUY CE"
+        decision_col = "#00c853"
+        decision_bg  = "#0d3320"
+        emoji        = "🟢"
+        strength     = "Strong"
+    elif price_rising is False and oi_rising:
+        scenario     = "Short Buildup"
+        decision     = "BUY PE"
+        decision_col = "#f44336"
+        decision_bg  = "#3d0a0a"
+        emoji        = "🔴"
+        strength     = "Strong"
+    elif price_rising is True  and not oi_rising:
+        scenario     = "Short Covering"
+        decision     = "CAUTION — Exit PE"
+        decision_col = "#ffc107"
+        decision_bg  = "#2a2200"
+        emoji        = "🟡"
+        strength     = "Weak"
+    elif price_rising is False and not oi_rising:
+        scenario     = "Long Unwinding"
+        decision     = "CAUTION — Exit CE"
+        decision_col = "#ffc107"
+        decision_bg  = "#2a2200"
+        emoji        = "🟡"
+        strength     = "Weak"
+    else:
+        scenario     = "Neutral"
+        decision     = "WAIT"
+        decision_col = "#90caf9"
+        decision_bg  = "#0d1f33"
+        emoji        = "⚪"
+        strength     = "Neutral"
+
+    # ── Max OI strike (support/resistance walls) ─────────────
+    max_ce_oi_strike = max(chain.keys(), key=lambda s: chain[s].get("ce_oi", 0)) if chain else None
+    max_pe_oi_strike = max(chain.keys(), key=lambda s: chain[s].get("pe_oi", 0)) if chain else None
+    max_ce_oi_val    = chain[max_ce_oi_strike].get("ce_oi", 0) if max_ce_oi_strike else 0
+    max_pe_oi_val    = chain[max_pe_oi_strike].get("pe_oi", 0) if max_pe_oi_strike else 0
+
+    # Resistance wall: highest CE OI strike (option sellers defend here)
+    # Support wall:    highest PE OI strike (option sellers defend here)
+    resistance_wall = max_ce_oi_strike  # call writers defend this level
+    support_wall    = max_pe_oi_strike  # put writers defend this level
+
+    # ── PCR from chain ───────────────────────────────────────
+    pcr_now  = round(total_pe_oi_now  / total_ce_oi_now,  2) if total_ce_oi_now  else None
+    pcr_prev = round(total_pe_oi_prev / total_ce_oi_prev, 2) if total_ce_oi_prev else None
+    pcr_rising = (pcr_now > pcr_prev) if (pcr_now and pcr_prev) else None
+
+    # ── OI availability and zero-data fallback ──────────────────
+    oi_data_available = (total_ce_oi_now > 0 or total_pe_oi_now > 0)
+
+    if not oi_data_available:
+        # OI data not returned by API — use price direction only
+        if price_rising is True:
+            scenario, decision = "Price Rising", "Lean CE (Price signal)"
+            decision_col, decision_bg, emoji, strength = "#00c853","#0d3320","🟢","Moderate"
+        elif price_rising is False:
+            scenario, decision = "Price Falling", "Lean PE (Price signal)"
+            decision_col, decision_bg, emoji, strength = "#f44336","#3d0a0a","🔴","Moderate"
+        else:
+            scenario, decision = "Neutral", "WAIT"
+            decision_col, decision_bg, emoji, strength = "#90caf9","#0d1f33","⚪","Neutral"
+
+    # ── Liquidity: top OI strikes — fallback to highest LTP ──────
+    if chain:
+        oi_values  = sorted([v.get("ce_oi", 0) + v.get("pe_oi", 0)
+                             for v in chain.values()], reverse=True)
+        top_decile = oi_values[0] * 0.7 if oi_values[0] > 0 else 0
+        liquid_strikes = [s for s, v in chain.items()
+                         if (v.get("ce_oi", 0) + v.get("pe_oi", 0)) >= top_decile
+                         and top_decile > 0]
+        if not liquid_strikes:
+            # Fallback: strikes with highest combined LTP (most active)
+            liquid_strikes = sorted(
+                chain.keys(),
+                key=lambda s: chain[s].get("ce_ltp",0) + chain[s].get("pe_ltp",0),
+                reverse=True
+            )[:3]
+    else:
+        liquid_strikes = []
+
+    return {
+        "scenario":         scenario,
+        "decision":         decision,
+        "decision_col":     decision_col,
+        "decision_bg":      decision_bg,
+        "emoji":            emoji,
+        "strength":         strength,
+        "price_rising":     price_rising,
+        "oi_rising":        oi_rising,
+        "oi_available":     oi_data_available,
+        "ce_oi_now":        total_ce_oi_now,
+        "pe_oi_now":        total_pe_oi_now,
+        "ce_oi_change":     ce_oi_change,
+        "pe_oi_change":     pe_oi_change,
+        "resistance_wall":  resistance_wall,
+        "support_wall":     support_wall,
+        "max_ce_oi":        max_ce_oi_val,
+        "max_pe_oi":        max_pe_oi_val,
+        "pcr":              pcr_now,
+        "pcr_prev":         pcr_prev,
+        "pcr_rising":       pcr_rising,
+        "liquid_strikes":   liquid_strikes,
+    }
+
 # ==============================================================
 # 9. INDICATORS
 # ==============================================================
@@ -487,7 +634,7 @@ def compute_indicators(df):
 #       Conflicted macro: score ≥ ±4 required
 # ==============================================================
 def generate_signal(ind, spot, vix, high_vol_window,
-                    change_pct=None, ind_15=None, ind_30=None):
+                    change_pct=None, ind_15=None, ind_30=None, oi_score_bonus=0):
     """
     Full multi-factor signal engine.
     ind        : primary timeframe indicators dict
@@ -624,6 +771,14 @@ def generate_signal(ind, spot, vix, high_vol_window,
             reasons.append(("bear", f"Intraday {change_pct:.2f}% — mildly negative day"))
         else:
             reasons.append(("info", f"Intraday {change_pct:+.2f}% — flat / sideways day"))
+
+    # ── OI Momentum bonus ────────────────────────
+    if oi_score_bonus != 0:
+        score += oi_score_bonus
+        if oi_score_bonus > 0:
+            reasons.append(("bull", f"OI Momentum: Long Buildup — CE positions increasing (+{oi_score_bonus})"))
+        else:
+            reasons.append(("bear", f"OI Momentum: Short Buildup — PE positions increasing ({oi_score_bonus})"))
 
     # ════════════════════════════════════════════
     # TRADING WINDOW MODIFIER
@@ -883,6 +1038,13 @@ if run_live and spot and atm:
         new_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
                                            expiry_str, atm, step, n=3)
         if new_chain:
+            # Save current chain as prev before overwriting
+            if st.session_state.last_chain:
+                prev_ts = st.session_state.chain_ts
+                # Only rotate to prev if chain is at least 25s old (meaningful OI change)
+                if prev_ts and (datetime.now() - prev_ts).total_seconds() >= 25:
+                    st.session_state.prev_chain    = dict(st.session_state.last_chain)
+                    st.session_state.prev_chain_ts = prev_ts
             st.session_state.last_chain = new_chain
             st.session_state.chain_ts   = datetime.now()
             chain = new_chain
@@ -1169,14 +1331,34 @@ elif spot and pe_strike:
     _pe_ltp_est = max(round(spot * iv * (dte_days / 365) ** 0.5 * 0.4, 1), 5.0)
     pe_snr = option_snr(_pe_ltp_est, iv_pct, dte_days, candle_df)
 
+
+# Compute OI momentum using current and previous chain
+_prev_chain  = st.session_state.prev_chain or {}
+_prev_prices = st.session_state.last_prices
+_prev_spot   = _prev_prices.get(conf["response_key"], {}).get("close") if _prev_prices else None
+_oi_momentum = compute_oi_momentum(chain, _prev_chain, spot, _prev_spot)
+
 # ==============================================================
 # 17. GENERATE SIGNAL
 # ==============================================================
+# Incorporate OI momentum into signal score
+_oi_score_bonus = 0
+if _oi_momentum:
+    if _oi_momentum["decision"] == "BUY CE":
+        _oi_score_bonus = 2
+    elif _oi_momentum["decision"] == "BUY PE":
+        _oi_score_bonus = -2
+    elif "Exit CE" in _oi_momentum["decision"]:
+        _oi_score_bonus = -1
+    elif "Exit PE" in _oi_momentum["decision"]:
+        _oi_score_bonus = 1
+
 signal = generate_signal(
     indicators, spot, st.session_state.last_vix, _high_vol,
     change_pct=change_pct,
     ind_15=ind_15,
     ind_30=ind_30,
+    oi_score_bonus=_oi_score_bonus,
 )
 
 # ==============================================================
@@ -1530,6 +1712,65 @@ elif run_live and not indicators:
     st.divider()
 
 # ==============================================================
+# OI MOMENTUM DECISION MATRIX  (below signal, above CE/PE panels)
+# ==============================================================
+if _oi_momentum and run_live:
+    with st.expander("📊 OI Momentum Decision Matrix", expanded=True):
+        oi = _oi_momentum
+
+        price_arrow = "↑" if oi["price_rising"] else ("↓" if oi["price_rising"] is False else "→")
+        oi_arrow    = "↑" if oi["oi_rising"]    else "↓"
+
+        st.markdown(
+            f'<div style="background:{oi["decision_bg"]};border:2px solid {oi["decision_col"]};'            f'border-radius:10px;padding:14px 18px;margin-bottom:12px;">'            f'<div style="display:flex;align-items:center;justify-content:space-between;">'            f'<div>'            f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">OI Momentum Signal</div>'            f'<div style="font-size:22px;font-weight:700;color:{oi["decision_col"]};margin-top:4px;">'            f'{oi["emoji"]} {oi["decision"]}</div>'            f'<div style="font-size:13px;color:#ccc;margin-top:4px;">'            f'Scenario: <b>{oi["scenario"]}</b> &nbsp;|&nbsp; '            f'Price {price_arrow} + OI {oi_arrow} &nbsp;|&nbsp; '            f'Strength: <b style="color:{oi["decision_col"]};">{oi["strength"]}</b>'            f'</div></div>'            f'<div style="text-align:right;font-size:13px;color:#aaa;">'            f'CE OI: <b style="color:#00c853;">{oi["ce_oi_now"]:,}</b><br>'            f'PE OI: <b style="color:#f44336;">{oi["pe_oi_now"]:,}</b><br>'            f'PCR: <b style="color:white;">{oi["pcr"] or "--"}</b>'            f'{"↑" if oi["pcr_rising"] else ("↓" if oi["pcr_rising"] is False else "")}'            f'</div></div></div>',
+            unsafe_allow_html=True
+        )
+
+        mc1, mc2 = st.columns([3, 2])
+        with mc1:
+            st.markdown("**Decision Matrix** (active row highlighted)")
+            matrix_rows = [
+                ("↑ Rising",  "↑ Increasing", "Long Buildup",   "Buy CE",           "#00c853", "#0d3320"),
+                ("↓ Falling", "↑ Increasing", "Short Buildup",  "Buy PE",           "#f44336", "#3d0a0a"),
+                ("↑ Rising",  "↓ Decreasing", "Short Covering", "Caution — Exit PE","#ffc107", "#2a2200"),
+                ("↓ Falling", "↓ Decreasing", "Long Unwinding", "Caution — Exit CE","#ffc107", "#2a2200"),
+            ]
+            tbl = ('<table style="width:100%;border-collapse:collapse;font-size:13px;">'                   '<thead><tr>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Price</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">OI</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Interpretation</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Recommendation</th>'                   '</tr></thead><tbody>')
+            for price_act, oi_mom, interp, rec_txt, fg, bg in matrix_rows:
+                is_cur  = oi["scenario"].replace(" ", "").lower() in interp.replace(" ", "").lower()
+                row_bg  = f"background:{bg};" if is_cur else ""
+                border  = f"border-left:3px solid {fg};" if is_cur else "border-left:3px solid transparent;"
+                tbl += (f'<tr style="{row_bg}{border}">'                        f'<td style="padding:7px 10px;color:#ccc;">{price_act}</td>'                        f'<td style="padding:7px 10px;color:#ccc;">{oi_mom}</td>'                        f'<td style="padding:7px 10px;color:#ccc;">{interp}</td>'                        f'<td style="padding:7px 10px;">'                        f'<span style="background:{bg};color:{fg};padding:2px 8px;'                        f'border-radius:4px;font-weight:600;font-size:12px;">{rec_txt}</span>'                        f'</td></tr>')
+            tbl += "</tbody></table>"
+            st.markdown(tbl, unsafe_allow_html=True)
+
+        with mc2:
+            st.markdown("**OI Walls (Max OI Strikes)**")
+            if oi["resistance_wall"] and oi["max_ce_oi"] > 0:
+                dist_r = round(oi["resistance_wall"] - (spot or 0), 0)
+                sign_r = f"+{dist_r:.0f}" if dist_r >= 0 else f"{dist_r:.0f}"
+                st.markdown(
+                    f'<div style="background:#3d0a0a;border:1px solid #f44336;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#f44336;text-transform:uppercase;">🔴 Resistance Wall</div>'                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["resistance_wall"]:,}'                    f'<span style="font-size:12px;color:#f44336;margin-left:8px;">({sign_r} pts)</span></div>'                    f'<div style="font-size:12px;color:#aaa;">CE OI: {oi["max_ce_oi"]:,}</div></div>',
+                    unsafe_allow_html=True)
+            if oi["support_wall"] and oi["max_pe_oi"] > 0:
+                dist_s = round(oi["support_wall"] - (spot or 0), 0)
+                sign_s = f"+{dist_s:.0f}" if dist_s >= 0 else f"{dist_s:.0f}"
+                st.markdown(
+                    f'<div style="background:#0d3320;border:1px solid #00c853;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#00c853;text-transform:uppercase;">🟢 Support Wall</div>'                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["support_wall"]:,}'                    f'<span style="font-size:12px;color:#00c853;margin-left:8px;">({sign_s} pts)</span></div>'                    f'<div style="font-size:12px;color:#aaa;">PE OI: {oi["max_pe_oi"]:,}</div></div>',
+                    unsafe_allow_html=True)
+            if oi["pcr"]:
+                pcr_col   = "#00c853" if oi["pcr"] > 1.0 else ("#f44336" if oi["pcr"] < 0.8 else "#ffc107")
+                pcr_trend = "↑ Rising (Bullish)" if oi["pcr_rising"] else ("↓ Falling (Bearish)" if oi["pcr_rising"] is False else "Stable")
+                st.markdown(
+                    f'<div style="background:#1a1a2e;border:1px solid #444;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;">PCR</div>'                    f'<div style="font-size:20px;font-weight:700;color:{pcr_col};">{oi["pcr"]}</div>'                    f'<div style="font-size:12px;color:#aaa;">{pcr_trend}</div></div>',
+                    unsafe_allow_html=True)
+            if oi["liquid_strikes"]:
+                st.markdown(
+                    f'<div style="font-size:12px;color:#aaa;padding:8px;">'                    f'<b>Liquid strikes:</b> {", ".join(str(s) for s in sorted(oi["liquid_strikes"]))}'                    f'</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+# ==============================================================
 # 20. RECOMMENDED CE / PE PANELS  (directly below signal card)
 # ==============================================================
 
@@ -1639,6 +1880,7 @@ if spot and atm:
     st.divider()
 
 # ==============================================================
+
 # 21. TOP METRICS
 # ==============================================================
 if spot and atm:

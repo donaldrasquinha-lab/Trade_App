@@ -1045,67 +1045,118 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
 #      using delta. Works immediately — no candle data needed.
 #      Falls back to simple ±% bands when no candle data yet.
 # ==============================================================
+# ==============================================================
+# OPTION S/R — computed directly from option premium
+#
+# Three sources merged per option:
+#   1. Round premium levels  (e.g. 180, 185, 190 for CE at 186)
+#   2. IV-based daily move bands  (±1 sigma intraday range)
+#   3. Pivot levels from option OHLC if candle data available
+# This is completely independent of the index price.
+# ==============================================================
+
+def option_snr(ltp, iv_pct, dte_days, candle_df_arg=None):
+    """
+    Compute support and resistance directly for an option premium.
+
+    ltp        : current option LTP (Rs.)
+    iv_pct     : implied volatility as integer percent (e.g. 15)
+    dte_days   : days to expiry
+    candle_df_arg: index candle df for pivot extraction (optional)
+
+    Returns {"support": [...], "resistance": [...]}
+    """
+    if not ltp or ltp <= 0:
+        return {"support": [], "resistance": []}
+
+    levels_sup = []
+    levels_res = []
+    iv = iv_pct / 100.0 if iv_pct else 0.15
+
+    # ── 1. Round number levels ──────────────────────────────
+    # Options traders watch round numbers (50, 100, 150, 200...)
+    # Choose step based on premium magnitude
+    if ltp >= 500:   step = 50
+    elif ltp >= 200: step = 25
+    elif ltp >= 100: step = 10
+    elif ltp >= 50:  step = 5
+    else:            step = 2
+
+    base = round(ltp / step) * step
+    for i in range(1, 5):
+        s = round(base - i * step, 1)
+        r = round(base + i * step, 1)
+        if 0 < s < ltp:  levels_sup.append(s)
+        if r > ltp:      levels_res.append(r)
+
+    # ── 2. IV-based intraday move bands ────────────────────
+    # Daily 1-sigma move of the option premium ≈ ltp * iv / sqrt(252)
+    # Intraday (half-day) ≈ divide by sqrt(2)
+    import math
+    daily_sigma = ltp * iv / math.sqrt(252)
+    intra_sigma = daily_sigma / math.sqrt(2)
+
+    for mult in [0.5, 1.0, 1.5, 2.0]:
+        s = round(ltp - mult * intra_sigma, 1)
+        r = round(ltp + mult * intra_sigma, 1)
+        if 0 < s < ltp:  levels_sup.append(s)
+        if r > ltp:      levels_res.append(r)
+
+    # ── 3. Index candle pivots scaled by delta (if available) ──
+    if candle_df_arg is not None and len(candle_df_arg) >= 6:
+        highs  = candle_df_arg["high"].values
+        lows   = candle_df_arg["low"].values
+        closes = candle_df_arg["close"].values
+        vols   = candle_df_arg["volume"].values if "volume" in candle_df_arg.columns else None
+
+        idx_cur = closes[-1]
+        # Rough delta estimate: option_ltp / spot (simplified)
+        rough_delta = min(max(ltp / (idx_cur * 0.05), 0.1), 0.9)
+
+        for i in range(2, len(candle_df_arg) - 2):
+            # Swing high → resistance
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                idx_dist = highs[i] - idx_cur
+                opt_lvl  = round(ltp + idx_dist * rough_delta, 1)
+                if opt_lvl > ltp * 1.005:
+                    levels_res.append(opt_lvl)
+            # Swing low → support
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                idx_dist = lows[i] - idx_cur
+                opt_lvl  = round(ltp + idx_dist * rough_delta, 1)
+                if 0 < opt_lvl < ltp * 0.995:
+                    levels_sup.append(opt_lvl)
+
+    # ── Deduplicate and sort ─────────────────────────────────
+    def clean(lst, above):
+        lst = [x for x in lst if x > 0]
+        lst = sorted(set(round(x, 1) for x in lst),
+                     reverse=not above)
+        result = []
+        for v in lst:
+            if not result:
+                result.append(v)
+            elif above and (v - result[-1]) / result[-1] > 0.008:
+                result.append(v)
+            elif not above and (result[-1] - v) / result[-1] > 0.008:
+                result.append(v)
+        return result[:3]
+
+    return {
+        "support":    clean(levels_sup, above=False),
+        "resistance": clean(levels_res, above=True),
+        "current":    ltp,
+    }
+
+# Compute S/R directly per option
 ce_snr = {"support": [], "resistance": [], "current": ce_ltp or 0}
 pe_snr = {"support": [], "resistance": [], "current": pe_ltp or 0}
 
-def scale_snr_to_premium(idx_support, idx_resistance, idx_current,
-                          option_ltp, delta):
-    """
-    Scale index S/R levels to option premium levels via delta.
-    delta: fractional (e.g. 0.5), not percentage.
-    Keeps levels within 30% of option_ltp on each side.
-    """
-    if not option_ltp or option_ltp <= 0 or not delta:
-        return [], []
+if ce_ltp and ce_ltp > 0:
+    ce_snr = option_snr(ce_ltp, iv_pct, dte_days, candle_df)
 
-    min_gap = max(option_ltp * 0.01, 0.5)   # at least 1% or 0.5 pts apart
-    supports, resistances = [], []
-
-    for p in idx_support:
-        opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
-        # Support: below ltp, positive, within 30% down
-        if 0 < opt_lvl < (option_ltp - min_gap) and opt_lvl > option_ltp * 0.70:
-            supports.append(opt_lvl)
-
-    for p in idx_resistance:
-        opt_lvl = round(option_ltp + (p - idx_current) * delta, 1)
-        # Resistance: above ltp, within 30% up
-        if opt_lvl > (option_ltp + min_gap) and opt_lvl < option_ltp * 1.30:
-            resistances.append(opt_lvl)
-
-    # Deduplicate levels too close together (within 0.5%)
-    def dedup(lst):
-        result = []
-        for v in sorted(lst):
-            if not result or (v - result[-1]) / result[-1] > 0.005:
-                result.append(v)
-        return result
-
-    return dedup(supports)[-3:], dedup(resistances)[:3]
-
-ce_delta_val = abs(g_ce["delta"]) if g_ce and g_ce.get("delta") else 0.5
-pe_delta_val = abs(g_pe["delta"]) if g_pe and g_pe.get("delta") else 0.5
-
-if spot and ce_ltp and pe_ltp:
-    if candle_df is not None and len(candle_df) >= 6:
-        # Best case: use candle-derived S/R
-        idx_snr_data  = compute_snr(candle_df, n_levels=5)
-        idx_sup  = idx_snr_data["support"]
-        idx_res  = idx_snr_data["resistance"]
-        idx_cur  = idx_snr_data["current"]
-    else:
-        # Fallback: synthesise S/R from spot using round-number levels
-        # Works immediately without candle data
-        step_sz  = conf["strike_step"]
-        idx_cur  = spot
-        idx_sup  = [round(spot - i * step_sz, 0) for i in range(1, 6)]
-        idx_res  = [round(spot + i * step_sz, 0) for i in range(1, 6)]
-
-    ce_sup, ce_res = scale_snr_to_premium(idx_sup, idx_res, idx_cur, ce_ltp, ce_delta_val)
-    pe_sup, pe_res = scale_snr_to_premium(idx_sup, idx_res, idx_cur, pe_ltp, pe_delta_val)
-
-    ce_snr = {"support": ce_sup, "resistance": ce_res, "current": ce_ltp}
-    pe_snr = {"support": pe_sup, "resistance": pe_res, "current": pe_ltp}
+if pe_ltp and pe_ltp > 0:
+    pe_snr = option_snr(pe_ltp, iv_pct, dte_days, candle_df)
 
 # ==============================================================
 # 17. GENERATE SIGNAL

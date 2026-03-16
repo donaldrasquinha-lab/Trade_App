@@ -94,8 +94,10 @@ defaults = {
     "candle_ts_30": None,
     "pcr":          None,
     "fii_data":     None,
-    "opt_candles":  {},     # {instrument_key: df} for option S/R
+    "opt_candles":  {},
     "opt_candle_ts": None,
+    "pcr_chain":    {},     # full chain for PCR (wider strikes)
+    "pcr_chain_ts": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -901,12 +903,32 @@ if run_live and spot and atm:
     )
     if chain_age >= 5:
         expiry_str = expiry_date.strftime("%Y-%m-%d")
+        # ATM ±3 for display
         new_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
                                            expiry_str, atm, step, n=3)
         if new_chain:
             st.session_state.last_chain = new_chain
             st.session_state.chain_ts   = datetime.now()
             chain = new_chain
+        # ATM ±15 for accurate PCR (wider = better OI sample)
+        pcr_age = (
+            (datetime.now() - st.session_state.pcr_chain_ts).total_seconds()
+            if st.session_state.pcr_chain_ts else 999
+        )
+        if pcr_age >= 30:   # PCR needs less frequent refresh
+            wide_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
+                                               expiry_str, atm, step, n=15)
+            if wide_chain:
+                st.session_state.pcr_chain    = wide_chain
+                st.session_state.pcr_chain_ts = datetime.now()
+
+# Compute PCR from wide chain for accuracy
+_pcr_chain = st.session_state.pcr_chain
+if _pcr_chain:
+    _total_ce_oi = sum(v.get("ce_oi", 0) for v in _pcr_chain.values())
+    _total_pe_oi = sum(v.get("pe_oi", 0) for v in _pcr_chain.values())
+    if _total_ce_oi > 0:
+        st.session_state.pcr = round(_total_pe_oi / _total_ce_oi, 2)
 
 ce_strike = atm - strike_offset * step if atm else None
 pe_strike = atm + strike_offset * step if atm else None
@@ -931,14 +953,6 @@ else:
     g_ce = g_pe = None
     greeks_source = "--"
 
-
-
-# Compute PCR from option chain (total CE OI vs PE OI across all strikes)
-if chain:
-    total_ce_oi = sum(v.get("ce_oi", 0) for v in chain.values())
-    total_pe_oi = sum(v.get("pe_oi", 0) for v in chain.values())
-    if total_ce_oi > 0:
-        st.session_state.pcr = round(total_pe_oi / total_ce_oi, 2)
 
 # ==============================================================
 # 17b. MARKET OUTLOOK ENGINE
@@ -1251,7 +1265,17 @@ with h1:
         st.caption(f"Spot updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
 with h2:
     if st.session_state.last_vix:
-        st.caption(f"VIX: {st.session_state.last_vix:.2f}%  |  PCR: {st.session_state.pcr or '--'}")
+        pcr_val = st.session_state.pcr
+        vix_val = st.session_state.last_vix
+        vix_str = f"VIX: {vix_val:.2f}%" if vix_val else "VIX: --"
+        if pcr_val:
+            if pcr_val > 1.2:   pcr_color, pcr_icon = "green",  "📈"
+            elif pcr_val < 0.8: pcr_color, pcr_icon = "red",    "📉"
+            else:               pcr_color, pcr_icon = "orange", "➡️"
+            pcr_str = f"{pcr_icon} PCR: **{pcr_val}**"
+        else:
+            pcr_str = "PCR: fetching..."
+        st.caption(f"{vix_str}  |  {pcr_str}")
 with h3:
     st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
 
@@ -1713,6 +1737,128 @@ if indicators or ind_15 or ind_30:
     st.divider()
 
 
+
+# ==============================================================
+# 23b. SUPPORT & RESISTANCE PANEL
+# ==============================================================
+if candle_df is not None and spot and len(candle_df) >= 6:
+    with st.expander(f"📐 Support & Resistance — {selected_index} ({candle_interval}m chart)", expanded=True):
+        idx_snr = compute_snr(candle_df, n_levels=5)
+        supports    = idx_snr.get("support", [])
+        resistances = idx_snr.get("resistance", [])
+        current_px  = idx_snr.get("current", spot)
+
+        # Build visual level map
+        all_levels = (
+            [{"price": p, "type": "R", "color": "#f44336", "bg": "#3d0a0a"} for p in sorted(resistances, reverse=True)] +
+            [{"price": current_px, "type": "NOW", "color": "#ffffff", "bg": "#1a1a3e"}] +
+            [{"price": p, "type": "S", "color": "#00c853", "bg": "#0d3320"} for p in sorted(supports, reverse=True)]
+        )
+
+        # Left column: visual price ladder
+        lc, rc = st.columns([1, 1])
+        with lc:
+            st.markdown("**Price Ladder**")
+            for lvl in all_levels:
+                p    = lvl["price"]
+                t    = lvl["type"]
+                col  = lvl["color"]
+                bg   = lvl["bg"]
+                dist = round(p - current_px, 1)
+                sign = f"+{dist}" if dist > 0 else str(dist)
+                width = "100%" if t == "NOW" else "80%"
+                border = "2px solid #fff" if t == "NOW" else f"1px solid {col}"
+                label  = f"🔴 R  {p:,.1f}  ({sign})" if t == "R" else                          f"⚪ NOW  {p:,.1f}" if t == "NOW" else                          f"🟢 S  {p:,.1f}  ({sign})"
+                st.markdown(
+                    f'<div style="background:{bg};border:{border};border-radius:6px;'
+                    f'padding:6px 12px;margin:3px 0;width:{width};font-size:13px;'
+                    f'font-weight:{"700" if t=="NOW" else "500"};color:{col};">'
+                    f'{label}</div>',
+                    unsafe_allow_html=True
+                )
+
+        with rc:
+            st.markdown("**Key Levels Summary**")
+            if resistances:
+                nearest_r = min(resistances)
+                pts_to_r  = round(nearest_r - current_px, 1)
+                st.metric("Nearest Resistance", f"{nearest_r:,.1f}", f"+{pts_to_r} pts")
+            if supports:
+                nearest_s = max(supports)
+                pts_to_s  = round(current_px - nearest_s, 1)
+                st.metric("Nearest Support",    f"{nearest_s:,.1f}", f"-{pts_to_s} pts")
+            if supports and resistances:
+                range_pts = round(min(resistances) - max(supports), 1)
+                mid_pt    = round((min(resistances) + max(supports)) / 2, 1)
+                st.metric("Trading Range",      f"{range_pts} pts", f"Mid: {mid_pt:,.1f}")
+
+            # Position within range
+            if supports and resistances:
+                s_price = max(supports)
+                r_price = min(resistances)
+                if r_price > s_price:
+                    pct = round((current_px - s_price) / (r_price - s_price) * 100, 1)
+                    bar_fill = int(pct / 10)
+                    bar = "█" * bar_fill + "░" * (10 - bar_fill)
+                    pos_color = "#f44336" if pct > 75 else ("#00c853" if pct < 25 else "#ffc107")
+                    st.markdown(
+                        f'<div style="margin-top:12px;">'
+                        f'<div style="font-size:12px;color:#aaa;margin-bottom:4px;">Position in range</div>'
+                        f'<div style="display:flex;align-items:center;gap:8px;">'
+                        f'<span style="font-size:11px;color:#00c853;">S</span>'
+                        f'<span style="font-family:monospace;color:{pos_color};font-size:14px;">{bar}</span>'
+                        f'<span style="font-size:11px;color:#f44336;">R</span>'
+                        f'<b style="color:{pos_color};margin-left:4px;">{pct}%</b>'
+                        f'</div></div>',
+                        unsafe_allow_html=True
+                    )
+
+        st.divider()
+
+        # Option premium S/R table
+        if ce_ltp or pe_ltp:
+            st.markdown("**Option Premium S/R Levels**")
+            op1, op2 = st.columns(2)
+            with op1:
+                st.markdown(f"🟢 **{ce_strike} CE** (LTP: Rs.{ce_ltp:.2f})")
+                if ce_snr.get("resistance"):
+                    for r in sorted(ce_snr["resistance"])[:3]:
+                        dist = round(r - ce_ltp, 2)
+                        st.markdown(
+                            f'<span style="background:#3d0a0a;color:#f44336;border-radius:4px;'
+                            f'padding:2px 8px;font-size:12px;margin:2px;">R {r:.1f} (+{dist:.1f})</span>',
+                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<span style="background:#1a1a3e;color:white;border:1px solid white;'
+                    f'border-radius:4px;padding:2px 8px;font-size:12px;margin:2px;">LTP {ce_ltp:.1f}</span>',
+                    unsafe_allow_html=True)
+                if ce_snr.get("support"):
+                    for s in sorted(ce_snr["support"], reverse=True)[:3]:
+                        dist = round(ce_ltp - s, 2)
+                        st.markdown(
+                            f'<span style="background:#0d3320;color:#00c853;border-radius:4px;'
+                            f'padding:2px 8px;font-size:12px;margin:2px;">S {s:.1f} (-{dist:.1f})</span>',
+                            unsafe_allow_html=True)
+            with op2:
+                st.markdown(f"🔴 **{pe_strike} PE** (LTP: Rs.{pe_ltp:.2f})")
+                if pe_snr.get("resistance"):
+                    for r in sorted(pe_snr["resistance"])[:3]:
+                        dist = round(r - pe_ltp, 2)
+                        st.markdown(
+                            f'<span style="background:#3d0a0a;color:#f44336;border-radius:4px;'
+                            f'padding:2px 8px;font-size:12px;margin:2px;">R {r:.1f} (+{dist:.1f})</span>',
+                            unsafe_allow_html=True)
+                st.markdown(
+                    f'<span style="background:#1a1a3e;color:white;border:1px solid white;'
+                    f'border-radius:4px;padding:2px 8px;font-size:12px;margin:2px;">LTP {pe_ltp:.1f}</span>',
+                    unsafe_allow_html=True)
+                if pe_snr.get("support"):
+                    for s in sorted(pe_snr["support"], reverse=True)[:3]:
+                        dist = round(pe_ltp - s, 2)
+                        st.markdown(
+                            f'<span style="background:#0d3320;color:#00c853;border-radius:4px;'
+                            f'padding:2px 8px;font-size:12px;margin:2px;">S {s:.1f} (-{dist:.1f})</span>',
+                            unsafe_allow_html=True)
 
 # ==============================================================
 # 24. OPTION CHAIN TABLE

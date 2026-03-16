@@ -92,12 +92,9 @@ defaults = {
     "candle_ts_15": None,
     "candle_df_30": None,  # 30m candles
     "candle_ts_30": None,
-    "pcr":          None,
     "fii_data":     None,
     "opt_candles":  {},
     "opt_candle_ts": None,
-    "pcr_chain":    {},     # full chain for PCR (wider strikes)
-    "pcr_chain_ts": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -342,16 +339,10 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
                         og = getattr(opt, "option_greeks", None) or {}
                         if hasattr(md, "to_dict"): md = md.to_dict()
                         if hasattr(og, "to_dict"): og = og.to_dict()
-                    # OI field varies by API version: try all known names
-                    oi_val = int(
-                        md.get("oi", 0) or
-                        md.get("open_interest", 0) or
-                        md.get("total_buy_quantity", 0) or 0
-                    )
+                    oi_val = int(md.get("oi", 0) or 0)
                     return {
                         "ltp":   float(md.get("ltp", 0) or 0),
                         "oi":    oi_val,
-                        "vol":   int(md.get("volume", 0) or 0),
                         "iv":    float(og.get("iv",    0) or 0),
                         "delta": float(og.get("delta", 0) or 0),
                         "theta": float(og.get("theta", 0) or 0),
@@ -369,7 +360,6 @@ def fetch_option_chain(token, instrument_key, expiry_date_str, atm, step, n=3):
                     "ce_gamma":ce.get("gamma",0),"pe_gamma":pe.get("gamma",0),
                     "ce_vega": ce.get("vega", 0),"pe_vega": pe.get("vega",0),
                     "ce_oi":  ce.get("oi",   0), "pe_oi":  pe.get("oi",  0),
-                    "ce_vol": ce.get("vol",  0), "pe_vol": pe.get("vol", 0),
                 }
         return chain, None
     except Exception as e:
@@ -488,7 +478,6 @@ def compute_indicators(df):
 #
 #     LAYER 2 — Macro/Market (max ±4 pts, fed into same score)
 #       India VIX            ±1  (direction bias + confidence cap)
-#       PCR                  ±1  (put-call ratio bias)
 #       Intraday change      ±1  (day trend confirmation)
 #       VIX extreme          confidence cap override
 #
@@ -498,12 +487,11 @@ def compute_indicators(df):
 #       Conflicted macro: score ≥ ±4 required
 # ==============================================================
 def generate_signal(ind, spot, vix, high_vol_window,
-                    pcr=None, change_pct=None, ind_15=None, ind_30=None):
+                    change_pct=None, ind_15=None, ind_30=None):
     """
     Full multi-factor signal engine.
     ind        : primary timeframe indicators dict
     vix        : India VIX float
-    pcr        : put-call ratio float (PE OI / CE OI)
     change_pct : intraday % change of index
     ind_15     : 15m indicators dict (optional, for MTF)
     ind_30     : 30m indicators dict (optional, for MTF)
@@ -622,28 +610,7 @@ def generate_signal(ind, spot, vix, high_vol_window,
             score += 1       # VIX 12–16 = ideal scalping conditions
             reasons.append(("bull", f"VIX {vix:.1f} in ideal range (12–16) — good scalping conditions (+1)"))
 
-    # ── 9. Put-Call Ratio ─────────────────────
-    if pcr is not None:
-        tech_bull = score > 0    # is technical side currently bullish?
-        if pcr > 1.3:
-            score += 1
-            reasons.append(("bull", f"PCR {pcr:.2f} > 1.3 — heavy put writing, market makers bullish (+1)"))
-        elif pcr > 1.0:
-            score += 1
-            reasons.append(("bull", f"PCR {pcr:.2f} > 1.0 — mild put writing, slight bullish tilt (+1)"))
-        elif pcr < 0.7:
-            score -= 1
-            reasons.append(("bear", f"PCR {pcr:.2f} < 0.7 — low put writing, bearish sentiment (-1)"))
-            if tech_bull:
-                macro_conflict = True
-                reasons.append(("warn", "⚠️ Conflict: technicals bullish but PCR bearish — threshold raised"))
-        elif pcr < 0.85:
-            score -= 1
-            reasons.append(("bear", f"PCR {pcr:.2f} mildly bearish — more calls than puts (-1)"))
-        else:
-            reasons.append(("info", f"PCR {pcr:.2f} neutral (0.85–1.0)"))
-
-    # ── 10. Intraday change ───────────────────
+    # ── 9. Intraday change ───────────────────
     if change_pct is not None:
         if change_pct > 0.8:
             score += 1
@@ -920,33 +887,6 @@ if run_live and spot and atm:
             st.session_state.chain_ts   = datetime.now()
             chain = new_chain
 
-    # ── PCR chain: ATM ±15, refresh every 30s (independent) ──
-    pcr_age = (
-        (datetime.now() - st.session_state.pcr_chain_ts).total_seconds()
-        if st.session_state.pcr_chain_ts else 999
-    )
-    if pcr_age >= 30:
-        wide_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
-                                           expiry_str, atm, step, n=15)
-        if wide_chain:
-            st.session_state.pcr_chain    = wide_chain
-            st.session_state.pcr_chain_ts = datetime.now()
-
-# Compute PCR — use wide chain if available, fall back to display chain
-_pcr_chain = st.session_state.pcr_chain or st.session_state.last_chain
-if _pcr_chain and len(_pcr_chain) > 0:
-    # Try OI first, fall back to volume if OI is all zeros
-    _total_ce_oi  = sum(v.get("ce_oi",  0) for v in _pcr_chain.values())
-    _total_pe_oi  = sum(v.get("pe_oi",  0) for v in _pcr_chain.values())
-    _total_ce_vol = sum(v.get("ce_vol", 0) for v in _pcr_chain.values())
-    _total_pe_vol = sum(v.get("pe_vol", 0) for v in _pcr_chain.values())
-
-    if _total_ce_oi > 0:
-        # OI-based PCR (preferred)
-        st.session_state.pcr = round(_total_pe_oi / _total_ce_oi, 2)
-    elif _total_ce_vol > 0:
-        # Volume-based PCR (fallback when OI not available)
-        st.session_state.pcr = round(_total_pe_vol / _total_ce_vol, 2)
 
 ce_strike = atm - strike_offset * step if atm else None
 pe_strike = atm + strike_offset * step if atm else None
@@ -977,10 +917,9 @@ else:
 #      Derives Bullish/Bearish/Sideways + metric table from
 #      live data: VIX, PCR from option chain, RSI, signal score
 # ==============================================================
-def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
+def compute_market_outlook(vix, rsi, signal_score, change_pct):
     """
     Returns outlook dict with overall sentiment and metric rows.
-    PCR > 1.2 = bullish (more puts = hedging), < 0.8 = bearish.
     VIX > 20 = high fear, < 13 = complacency.
     """
     bull_points = 0
@@ -1002,22 +941,6 @@ def compute_market_outlook(vix, pcr, rsi, signal_score, change_pct):
             bull_points += 1
             vix_sig = ("😌 Normal Volatility", "bull")
         metrics.append(("India VIX", f"{vix:.2f}", vix_sig[0], vix_sig[1]))
-
-    # PCR
-    if pcr is not None:
-        if pcr > 1.2:
-            bull_points += 2
-            pcr_sig = ("📈 Bullish Bias (heavy put writing)", "bull")
-        elif pcr > 0.9:
-            bull_points += 1
-            pcr_sig = ("➡️ Neutral / Sideways", "neutral")
-        elif pcr > 0.7:
-            bear_points += 1
-            pcr_sig = ("📉 Mildly Bearish", "warn")
-        else:
-            bear_points += 2
-            pcr_sig = ("📉 Bearish Bias (low put writing)", "bear")
-        metrics.append(("Nifty PCR", f"{pcr:.2f}", pcr_sig[0], pcr_sig[1]))
 
     # RSI
     if rsi:
@@ -1170,7 +1093,6 @@ if spot and ce_ltp and pe_ltp:
 # ==============================================================
 signal = generate_signal(
     indicators, spot, st.session_state.last_vix, _high_vol,
-    pcr=st.session_state.pcr,
     change_pct=change_pct,
     ind_15=ind_15,
     ind_30=ind_30,
@@ -1184,7 +1106,6 @@ signal = generate_signal(
 _signal_score = signal["score"] if signal else None
 _outlook = compute_market_outlook(
     vix         = st.session_state.last_vix,
-    pcr         = st.session_state.pcr,
     rsi         = indicators.get("rsi") if indicators else None,
     signal_score= _signal_score,
     change_pct  = change_pct,
@@ -1252,35 +1173,9 @@ with h1:
         st.caption(f"Spot updated: {'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago")
 with h2:
     if st.session_state.last_vix:
-        pcr_val = st.session_state.pcr
         vix_val = st.session_state.last_vix
         vix_str = f"VIX: {vix_val:.2f}%" if vix_val else "VIX: --"
-        if pcr_val and pcr_val > 0:
-            if pcr_val > 1.2:   pcr_icon = "📈"
-            elif pcr_val < 0.8: pcr_icon = "📉"
-            else:               pcr_icon = "➡️"
-            pcr_str = f"{pcr_icon} PCR: {pcr_val}"
-        else:
-            # Show chain OI debug so we can diagnose
-            _dbg_chain = st.session_state.last_chain
-            if _dbg_chain:
-                _dbg_ce = sum(v.get("ce_oi",0) for v in _dbg_chain.values())
-                _dbg_pe = sum(v.get("pe_oi",0) for v in _dbg_chain.values())
-                _dbg_cv = sum(v.get("ce_vol",0) for v in _dbg_chain.values())
-                _dbg_pv = sum(v.get("pe_vol",0) for v in _dbg_chain.values())
-                if _dbg_ce > 0:
-                    _quick_pcr = round(_dbg_pe / _dbg_ce, 2)
-                    pcr_str = f"➡️ PCR: {_quick_pcr} (live)"
-                    st.session_state.pcr = _quick_pcr
-                elif _dbg_cv > 0:
-                    _quick_pcr = round(_dbg_pv / _dbg_cv, 2)
-                    pcr_str = f"➡️ PCR: {_quick_pcr} (vol)"
-                    st.session_state.pcr = _quick_pcr
-                else:
-                    pcr_str = f"PCR: loading... (OI:{_dbg_ce} V:{_dbg_cv})"
-            else:
-                pcr_str = "PCR: waiting for chain..."
-        st.caption(f"{vix_str}  |  {pcr_str}")
+        st.caption(vix_str)
 with h3:
     st.caption(f"Expiry: {expiry_date.strftime('%d %b')} ({dte_days}d)")
 

@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 import upstox_client
-from upstox_client.rest import ApiException
 import time
 
 # --- 1. SECRETS LOADING ---
@@ -39,7 +38,6 @@ with st.sidebar:
     st.header("🛡️ Strategy & Risk")
     lots = st.number_input("Lots", min_value=1, value=1)
     lot_size = st.number_input("Lot Size (Nifty)", value=25) 
-    sl_pts = st.number_input("Stop Loss (Points)", value=15.0)
     strike_mode = st.selectbox("Strike Choice", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
 
@@ -53,11 +51,10 @@ while True:
         # EXACT CASE SENSITIVE KEY REQUIRED
         instrument_key = "NSE_INDEX|Nifty 50" 
         
-        # Calling .ltp() for v2 SDK
+        # Use api_version '2.0' as required by v2 SDK
         api_response = api_instance.ltp(instrument_key, '2.0')
         
-        # SAFETY CHECK: Verify key exists in the dictionary response
-        if instrument_key in api_response.data:
+        if hasattr(api_response, 'data') and instrument_key in api_response.data:
             spot = api_response.data[instrument_key].last_price
             atm = int(round(spot / 50) * 50)
             ce_strike, pe_strike = atm - (offset * 50), atm + (offset * 50)
@@ -79,11 +76,11 @@ while True:
                     g = calculate_greeks(spot, pe_strike, 4/365, 0.07, 0.15, "put")
                     st.write(f"**Delta:** `{g['delta']}` | **Theta:** `{g['theta']}`")
         else:
-            st.error(f"Key '{instrument_key}' not found in API response. Is the market open?")
+            # DEBUG: Show what keys ARE available if Nifty 50 is missing
+            available_keys = list(api_response.data.keys()) if hasattr(api_response, 'data') else "None"
+            st.error(f"'{instrument_key}' not found. Available keys: {available_keys}")
+            st.info("Ensure the market is open and your token hasn't expired.")
             
-    except ApiException as e:
-        st.error(f"Upstox API Error: {e.body if hasattr(e, 'body') else e}")
-        break
     except Exception as e:
         st.error(f"System Error: {e}")
         break

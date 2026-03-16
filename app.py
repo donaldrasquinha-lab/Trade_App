@@ -868,7 +868,63 @@ elif run_live and not indicators:
     st.divider()
 
 # ==============================================================
-# 20. TOP METRICS
+# 20. RECOMMENDED CE / PE PANELS  (directly below signal card)
+# ==============================================================
+if spot and atm and g_ce and g_pe:
+    col_ce, col_pe = st.columns(2)
+
+    with col_ce:
+        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "CE") else ""
+        st.success(f"### {ce_strike:,} CE — Call  {label}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Premium",      f"Rs.{ce_ltp:,.2f}" if ce_ltp else "--")
+        p2.metric("Buyer Margin", fmt_inr(ce_ltp * conf["lot_size"] * lots) if ce_ltp else "--")
+        p3.metric("OI",           f"{ce_data.get('ce_oi', 0):,}" if ce_data else "--")
+        st.divider()
+        a, b, c_ = st.columns(3)
+        a.metric("Delta",     g_ce["delta"], sign_str(g_ce["delta"]))
+        b.metric("Theta/day", g_ce["theta"])
+        c_.metric("Gamma",    g_ce["gamma"])
+        d_, e_, f_ = st.columns(3)
+        d_.metric("Vega", g_ce["vega"])
+        e_.metric("IV",   f"{g_ce['iv']:.1f}%")
+        f_.metric("Source", greeks_source)
+
+    with col_pe:
+        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "PE") else ""
+        st.error(f"### {pe_strike:,} PE — Put  {label}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Premium",      f"Rs.{pe_ltp:,.2f}" if pe_ltp else "--")
+        p2.metric("Buyer Margin", fmt_inr(pe_ltp * conf["lot_size"] * lots) if pe_ltp else "--")
+        p3.metric("OI",           f"{pe_data.get('pe_oi', 0):,}" if pe_data else "--")
+        st.divider()
+        a, b, c_ = st.columns(3)
+        a.metric("Delta",     g_pe["delta"], sign_str(g_pe["delta"]))
+        b.metric("Theta/day", g_pe["theta"])
+        c_.metric("Gamma",    g_pe["gamma"])
+        d_, e_, f_ = st.columns(3)
+        d_.metric("Vega", g_pe["vega"])
+        e_.metric("IV",   f"{g_pe['iv']:.1f}%")
+        f_.metric("Source", greeks_source)
+
+    st.divider()
+
+    # Net summary
+    st.markdown("### Net Position Summary")
+    net_delta = round(g_ce["delta"] + g_pe["delta"], 4)
+    net_theta = round(g_ce["theta"] + g_pe["theta"], 2)
+    n1, n2, n3, n4, n5 = st.columns(5)
+    n1.metric("Total Premium", fmt_inr((ce_ltp + pe_ltp) * conf["lot_size"] * lots))
+    n2.metric("Net Delta",     net_delta,
+              "Neutral" if abs(net_delta) < 0.05 else "Directional")
+    n3.metric("Net Theta/day", net_theta)
+    n4.metric("Net Gamma",     round(g_ce["gamma"] + g_pe["gamma"], 6))
+    n5.metric("Net Vega",      round(g_ce["vega"]  + g_pe["vega"],  2))
+
+    st.divider()
+
+# ==============================================================
+# 21. TOP METRICS
 # ==============================================================
 if spot and atm:
     exposure = spot * lots * conf["lot_size"]
@@ -882,7 +938,7 @@ if spot and atm:
     st.divider()
 
 # ==============================================================
-# 21. MULTI-TIMEFRAME INDICATOR PANEL
+# 23. MULTI-TIMEFRAME INDICATOR PANEL
 # ==============================================================
 def _ind_row(label, ind, tf, candles_n=None):
     """Render one timeframe indicator row."""
@@ -953,64 +1009,10 @@ if indicators or ind_15 or ind_30:
     _ind_row("30m", ind_30, "30m", n_30)
     st.divider()
 
-# ==============================================================
-# 22. GREEKS PANELS
-# ==============================================================
-if spot and atm and g_ce and g_pe:
-    col_ce, col_pe = st.columns(2)
 
-    with col_ce:
-        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "CE") else ""
-        st.success(f"### {ce_strike:,} CE — Call  {label}")
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Premium",      f"Rs.{ce_ltp:,.2f}" if ce_ltp else "--")
-        p2.metric("Buyer Margin", fmt_inr(ce_ltp * conf["lot_size"] * lots) if ce_ltp else "--")
-        p3.metric("OI",           f"{ce_data.get('ce_oi', 0):,}" if ce_data else "--")
-        st.divider()
-        a, b, c_ = st.columns(3)
-        a.metric("Delta",     g_ce["delta"], sign_str(g_ce["delta"]))
-        b.metric("Theta/day", g_ce["theta"])
-        c_.metric("Gamma",    g_ce["gamma"])
-        d_, e_, f_ = st.columns(3)
-        d_.metric("Vega", g_ce["vega"])
-        e_.metric("IV",   f"{g_ce['iv']:.1f}%")
-        f_.metric("Source", greeks_source)
-
-    with col_pe:
-        label = "✅ RECOMMENDED" if (signal and signal["direction"] == "PE") else ""
-        st.error(f"### {pe_strike:,} PE — Put  {label}")
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Premium",      f"Rs.{pe_ltp:,.2f}" if pe_ltp else "--")
-        p2.metric("Buyer Margin", fmt_inr(pe_ltp * conf["lot_size"] * lots) if pe_ltp else "--")
-        p3.metric("OI",           f"{pe_data.get('pe_oi', 0):,}" if pe_data else "--")
-        st.divider()
-        a, b, c_ = st.columns(3)
-        a.metric("Delta",     g_pe["delta"], sign_str(g_pe["delta"]))
-        b.metric("Theta/day", g_pe["theta"])
-        c_.metric("Gamma",    g_pe["gamma"])
-        d_, e_, f_ = st.columns(3)
-        d_.metric("Vega", g_pe["vega"])
-        e_.metric("IV",   f"{g_pe['iv']:.1f}%")
-        f_.metric("Source", greeks_source)
-
-    st.divider()
-
-    # Net summary
-    st.markdown("### Net Position Summary")
-    net_delta = round(g_ce["delta"] + g_pe["delta"], 4)
-    net_theta = round(g_ce["theta"] + g_pe["theta"], 2)
-    n1, n2, n3, n4, n5 = st.columns(5)
-    n1.metric("Total Premium", fmt_inr((ce_ltp + pe_ltp) * conf["lot_size"] * lots))
-    n2.metric("Net Delta",     net_delta,
-              "Neutral" if abs(net_delta) < 0.05 else "Directional")
-    n3.metric("Net Theta/day", net_theta)
-    n4.metric("Net Gamma",     round(g_ce["gamma"] + g_pe["gamma"], 6))
-    n5.metric("Net Vega",      round(g_ce["vega"]  + g_pe["vega"],  2))
-
-    st.divider()
 
 # ==============================================================
-# 23. OPTION CHAIN TABLE
+# 24. OPTION CHAIN TABLE
 # ==============================================================
 if chain:
     st.markdown("### Option Chain — ATM ± 3 Strikes")
@@ -1039,7 +1041,7 @@ if chain:
     st.divider()
 
 # ==============================================================
-# 24. ALL-INDEX OVERVIEW
+# 25. ALL-INDEX OVERVIEW
 # ==============================================================
 if run_live and all_prices:
     st.markdown("### All Index Prices")
@@ -1063,7 +1065,7 @@ if not run_live:
     st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
-# 25. AUTO-REFRESH
+# 26. AUTO-REFRESH
 # ==============================================================
 if run_live:
     time.sleep(_refresh / 1000)

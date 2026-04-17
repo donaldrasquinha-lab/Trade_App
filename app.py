@@ -4,10 +4,8 @@ With Signal Engine: VWAP, EMA9/21, Momentum, Trade Recommendation
 ------------------------------------------------------------------
 SETUP:
   1. pip install -r requirements.txt
-  2. Create .streamlit/secrets.toml:
-       [upstox]
-       access_token = "your_token_here"
-  3. streamlit run scalper_dashboard.py
+  2. streamlit run scalper_dashboard.py
+  3. Enter your Upstox access token in the sidebar
 """
 
 import time
@@ -29,13 +27,12 @@ st.set_page_config(
 )
 
 # ==============================================================
-# 2. SECRETS
+# 2. TOKEN — entered via sidebar (no secrets.toml needed)
 # ==============================================================
-try:
-    TOKEN = st.secrets["upstox"]["access_token"]
-except Exception:
-    st.error("Missing `access_token` in `.streamlit/secrets.toml`")
-    st.stop()
+# Token is stored in session_state and entered via sidebar UI.
+# We initialize it here; the actual input widget is in the sidebar section below.
+if "upstox_token" not in st.session_state:
+    st.session_state.upstox_token = ""
 
 # ==============================================================
 # 3. INDEX METADATA
@@ -402,11 +399,13 @@ def compute_snr(df, n_levels=3, merge_pct=0.005):
     # A swing low:  low[i]  < low[i-1]  and low[i]  < low[i+1]
     for i in range(2, len(df) - 2):
         # Swing high (resistance)
-        if highs[i] > highs[i-1] and highs[i] > highs[i+1] and            highs[i] > highs[i-2] and highs[i] > highs[i+2]:
+        if (highs[i] > highs[i-1] and highs[i] > highs[i+1] and
+            highs[i] > highs[i-2] and highs[i] > highs[i+2]):
             strength = int(volumes[i] / (np.mean(volumes) + 1e-9) * 2)
             levels.append((highs[i], "resistance", max(1, min(strength, 5))))
         # Swing low (support)
-        if lows[i] < lows[i-1] and lows[i] < lows[i+1] and            lows[i] < lows[i-2] and lows[i] < lows[i+2]:
+        if (lows[i] < lows[i-1] and lows[i] < lows[i+1] and
+            lows[i] < lows[i-2] and lows[i] < lows[i+2]):
             strength = int(volumes[i] / (np.mean(volumes) + 1e-9) * 2)
             levels.append((lows[i], "support", max(1, min(strength, 5))))
 
@@ -778,36 +777,9 @@ def compute_indicators(df):
 
 # ==============================================================
 # 10. SIGNAL ENGINE  (Multi-factor: Technical + Macro)
-#
-#     LAYER 1 — Technical (max ±8 pts)
-#       EMA9 vs EMA21        ±1
-#       EMA crossover        ±2  (strong)
-#       Price vs VWAP        ±1
-#       Price vs EMA9        ±1
-#       RSI                  ±1
-#       MTF 15m alignment    ±1  (bonus if 15m agrees)
-#       MTF 30m alignment    ±1  (bonus if 30m agrees)
-#
-#     LAYER 2 — Macro/Market (max ±4 pts, fed into same score)
-#       India VIX            ±1  (direction bias + confidence cap)
-#       Intraday change      ±1  (day trend confirmation)
-#       VIX extreme          confidence cap override
-#
-#     THRESHOLD — dynamic based on market conditions
-#       Normal:    score ≥ ±3 triggers recommendation
-#       High VIX:  score ≥ ±4 required (harder to trigger)
-#       Conflicted macro: score ≥ ±4 required
 # ==============================================================
 def generate_signal(ind, spot, vix, high_vol_window,
                     change_pct=None, ind_15=None, ind_30=None, oi_score_bonus=0):
-    """
-    Full multi-factor signal engine.
-    ind        : primary timeframe indicators dict
-    vix        : India VIX float
-    change_pct : intraday % change of index
-    ind_15     : 15m indicators dict (optional, for MTF)
-    ind_30     : 30m indicators dict (optional, for MTF)
-    """
     if not ind or spot is None:
         return None
 
@@ -819,10 +791,6 @@ def generate_signal(ind, spot, vix, high_vol_window,
     ema21 = ind["ema21"]
     vwap  = ind["vwap"]
     rsi   = ind["rsi"]
-
-    # ════════════════════════════════════════════
-    # LAYER 1: TECHNICAL INDICATORS
-    # ════════════════════════════════════════════
 
     # ── 1. EMA9 vs EMA21 trend ────────────────
     if ema9 > ema21:
@@ -900,29 +868,24 @@ def generate_signal(ind, spot, vix, high_vol_window,
         else:
             reasons.append(("info", "30m chart: mixed / neutral"))
 
-    # ════════════════════════════════════════════
-    # LAYER 2: MACRO / MARKET CONTEXT
-    # ════════════════════════════════════════════
+    # ── LAYER 2: MACRO ──────────────────────────
+    vix_extreme   = False
+    macro_conflict = False
 
-    vix_extreme   = False   # True = require higher threshold
-    macro_conflict = False  # True = technical & macro disagree
-
-    # ── 8. India VIX ──────────────────────────
     if vix is not None:
         if vix > 22:
-            score -= 1       # high fear biases toward PE
+            score -= 1
             vix_extreme = True
             reasons.append(("bear", f"VIX {vix:.1f} > 22 — high fear, bearish bias (-1), threshold raised"))
         elif vix > 16:
             reasons.append(("warn", f"VIX {vix:.1f} elevated — widen stop-loss by 50%"))
         elif vix < 12:
-            score -= 1       # low VIX = complacency, moves may be muted
+            score -= 1
             reasons.append(("warn", f"VIX {vix:.1f} very low — weak momentum, signal penalised (-1)"))
         else:
-            score += 1       # VIX 12–16 = ideal scalping conditions
+            score += 1
             reasons.append(("bull", f"VIX {vix:.1f} in ideal range (12–16) — good scalping conditions (+1)"))
 
-    # ── 9. Intraday change ───────────────────
     if change_pct is not None:
         if change_pct > 0.8:
             score += 1
@@ -937,7 +900,6 @@ def generate_signal(ind, spot, vix, high_vol_window,
         else:
             reasons.append(("info", f"Intraday {change_pct:+.2f}% — flat / sideways day"))
 
-    # ── OI Momentum bonus ────────────────────────
     if oi_score_bonus != 0:
         score += oi_score_bonus
         if oi_score_bonus > 0:
@@ -945,22 +907,13 @@ def generate_signal(ind, spot, vix, high_vol_window,
         else:
             reasons.append(("bear", f"OI Momentum: Short Buildup — PE positions increasing ({oi_score_bonus})"))
 
-    # ════════════════════════════════════════════
-    # TRADING WINDOW MODIFIER
-    # ════════════════════════════════════════════
     if high_vol_window:
         reasons.append(("info", "Inside high-volatility window (9:15–10:15 AM) — prime scalping time"))
     else:
         score = int(score * 0.7)
         reasons.append(("warn", "Outside prime scalping window — score reduced 30%"))
 
-    # ════════════════════════════════════════════
-    # DYNAMIC THRESHOLD
-    # Normal market:   ±3 to trigger
-    # High VIX:        ±4 required  (volatile = need stronger signal)
-    # Macro conflict:  ±4 required  (technicals vs PCR disagreeing)
-    # Both:            ±5 required  (very high bar)
-    # ════════════════════════════════════════════
+    # Dynamic threshold
     if vix_extreme and macro_conflict:
         threshold = 5
         reasons.append(("warn", "Threshold raised to ±5 (high VIX + macro conflict)"))
@@ -972,7 +925,6 @@ def generate_signal(ind, spot, vix, high_vol_window,
 
     abs_score = abs(score)
 
-    # ── Final recommendation ──────────────────
     if score >= threshold:
         direction      = "CE"
         recommendation = "BUY CE"
@@ -994,8 +946,6 @@ def generate_signal(ind, spot, vix, high_vol_window,
         confidence     = "Low"
         emoji          = "⚪"
 
-    # ── Target & stop-loss ────────────────────
-    # Widen SL in high VIX conditions
     strike_move = 15
     sl_ratio    = 0.75 if (vix and vix > 16) else 0.5
     if direction == "CE":
@@ -1061,19 +1011,92 @@ _now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 _high_vol = is_high_volatility_window()
 
 # ==============================================================
-# 13. SIDEBAR
+# 13. SIDEBAR  (with token input)
 # ==============================================================
 with st.sidebar:
     st.markdown("## Scalper Controls")
     st.divider()
 
+    # ── Upstox Token Input ─────────────────────────────────────
+    st.markdown("### 🔑 Upstox Access Token")
+
+    # Try to load from secrets.toml as fallback (if user has it configured)
+    _secrets_token = ""
+    try:
+        _secrets_token = st.secrets["upstox"]["access_token"]
+    except Exception:
+        pass
+
+    # Token input — password-masked for security
+    _input_token = st.text_input(
+        "Access Token",
+        value=st.session_state.upstox_token or _secrets_token,
+        type="password",
+        placeholder="Paste your Upstox access token here",
+        help="Generate daily from Upstox Developer Console → My Apps → Get Token. "
+             "Tokens expire at midnight IST.",
+    )
+
+    # Update session state when token changes
+    if _input_token != st.session_state.upstox_token:
+        st.session_state.upstox_token = _input_token
+        # Reset validation when token changes
+        st.session_state.token_ok  = None
+        st.session_state.token_msg = ""
+
+    TOKEN = st.session_state.upstox_token
+
+    # Validate button
+    if TOKEN:
+        if st.button("✅ Validate Token", type="primary"):
+            with st.spinner("Validating with Upstox API..."):
+                ok, msg = validate_token(TOKEN)
+                st.session_state.token_ok  = ok
+                st.session_state.token_msg = msg
+
+        # Show validation status
+        if st.session_state.token_ok is True:
+            st.success("🟢 Token validated — ready to trade")
+        elif st.session_state.token_ok is False:
+            st.error(f"🔴 Invalid: {st.session_state.token_msg}")
+    else:
+        st.warning("⚠️ Enter your Upstox access token above to start")
+
+    # Help text
+    with st.expander("ℹ️ How to get your token"):
+        st.markdown("""
+1. Go to [Upstox Developer Console](https://account.upstox.com/developer/apps)
+2. Create an app (or use existing one)
+3. Use the **Get Token** flow to generate an access token
+4. Paste it above
+
+**Note:** Tokens expire daily at midnight IST. You'll need to paste a fresh token each trading day.
+
+**Alternative:** You can also set the token in `.streamlit/secrets.toml`:
+```toml
+[upstox]
+access_token = "your_token_here"
+```
+""")
+
+    st.divider()
+
+    # ── Index Selection ────────────────────────────────────────
     selected_index = st.selectbox("Index", list(INDEX_CONFIG.keys()))
     conf = INDEX_CONFIG[selected_index]
     auto_dte, expiry_date = get_dte(conf["expiry_weekday"])
 
     st.divider()
     st.markdown("### Strategy")
-    run_live      = st.toggle("Start Live Feed", key="live_feed")
+
+    # Only allow live feed if token is present
+    if TOKEN:
+        run_live = st.toggle("Start Live Feed", key="live_feed")
+    else:
+        run_live = False
+        st.toggle("Start Live Feed", key="live_feed", disabled=True,
+                  help="Enter your Upstox token first")
+
     lots          = st.number_input("Lots", min_value=1, max_value=500, value=1, step=1)
     strike_mode   = st.selectbox("Strike Selection", ["ATM", "1-Strike ITM", "2-Strike ITM"])
     strike_offset = {"ATM": 0, "1-Strike ITM": 1, "2-Strike ITM": 2}[strike_mode]
@@ -1100,20 +1123,6 @@ with st.sidebar:
         st.caption(f"Refresh: {_refresh}ms  |  Window: {'🔥 Hot' if _high_vol else '❄️ Calm'}")
     else:
         st.caption("📴 Market closed — refresh paused")
-
-    st.divider()
-    st.markdown("### Connection")
-    if st.button("Check Token"):
-        with st.spinner("Validating..."):
-            ok, msg = validate_token(TOKEN)
-            st.session_state.token_ok  = ok
-            st.session_state.token_msg = msg
-    if st.session_state.token_ok is True:
-        st.success("Token valid")
-    elif st.session_state.token_ok is False:
-        st.error(f"Token error: {st.session_state.token_msg}")
-    else:
-        st.caption("Press Check Token to validate")
 
     st.divider()
     st.caption("Market: 9:15 AM - 3:30 PM IST, Mon-Fri")
@@ -1146,6 +1155,32 @@ with st.sidebar:
                     st.write(f"**{k}** → `{v}`")
                     if dbg:
                         st.json(dbg)
+
+# ==============================================================
+# GUARD: Stop here if no token
+# ==============================================================
+if not TOKEN:
+    st.markdown("""
+    <div style="background:linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+        border:2px solid #ffc107; border-radius:16px; padding:40px; text-align:center;
+        margin:40px auto; max-width:700px;">
+        <div style="font-size:48px; margin-bottom:16px;">🔑</div>
+        <div style="font-size:24px; font-weight:700; color:#ffc107; margin-bottom:12px;">
+            Enter Your Upstox Access Token</div>
+        <div style="font-size:15px; color:#ccc; line-height:1.6; margin-bottom:20px;">
+            Paste your daily Upstox access token in the sidebar to connect to live market data.
+            <br>Tokens are generated from the
+            <a href="https://account.upstox.com/developer/apps" target="_blank"
+               style="color:#90caf9;">Upstox Developer Console</a>
+            and expire at midnight IST each day.
+        </div>
+        <div style="font-size:13px; color:#888;">
+            ← Open the sidebar and paste your token under 🔑 Upstox Access Token
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
 
 # ==============================================================
 # 14. FETCH SPOT PRICES
@@ -1186,15 +1221,13 @@ data_age   = (datetime.now() - feed_entry["ts"]).total_seconds() if feed_entry e
 
 # ==============================================================
 # 15. FETCH CANDLES  (primary + 15m + 30m)
-#     Primary: every 60s
-#     15m / 30m: every 5 min (candles change less frequently)
 # ==============================================================
 candle_df  = st.session_state.candle_df
 indicators = {}
 candle_err = None
 
-ind_15 = {}   # indicators from 15m chart
-ind_30 = {}   # indicators from 30m chart
+ind_15 = {}
+ind_30 = {}
 
 if run_live and spot:
     # -- Primary timeframe --
@@ -1247,7 +1280,6 @@ chain = st.session_state.last_chain
 if run_live and spot and atm:
     expiry_str = expiry_date.strftime("%Y-%m-%d")
 
-    # ── Display chain: ATM ±3, refresh every 5s ──────────────
     chain_age = (
         (datetime.now() - st.session_state.chain_ts).total_seconds()
         if st.session_state.chain_ts else 999
@@ -1256,10 +1288,8 @@ if run_live and spot and atm:
         new_chain, _ = fetch_option_chain(TOKEN, conf["instrument_key"],
                                            expiry_str, atm, step, n=3)
         if new_chain:
-            # Save current chain as prev before overwriting
             if st.session_state.last_chain:
                 prev_ts = st.session_state.chain_ts
-                # Only rotate to prev if chain is at least 25s old (meaningful OI change)
                 if prev_ts and (datetime.now() - prev_ts).total_seconds() >= 25:
                     st.session_state.prev_chain    = dict(st.session_state.last_chain)
                     st.session_state.prev_chain_ts = prev_ts
@@ -1284,7 +1314,6 @@ if ce_data and ce_data.get("ce_delta"):
             "iv":    round(pe_data["pe_iv"], 2)}
     greeks_source = "Exchange"
 elif spot and atm and ce_strike and pe_strike:
-    # Always compute BS Greeks when we have spot — never leave g_ce as None
     g_ce = bs_greeks(spot, ce_strike, dte, r, iv, "call"); g_ce["iv"] = iv_pct
     g_pe = bs_greeks(spot, pe_strike, dte, r, iv, "put");  g_pe["iv"] = iv_pct
     greeks_source = "BS Model"
@@ -1296,19 +1325,12 @@ else:
 
 # ==============================================================
 # 17b. MARKET OUTLOOK ENGINE
-#      Derives Bullish/Bearish/Sideways + metric table from
-#      live data: VIX, PCR from option chain, RSI, signal score
 # ==============================================================
 def compute_market_outlook(vix, rsi, signal_score, change_pct):
-    """
-    Returns outlook dict with overall sentiment and metric rows.
-    VIX > 20 = high fear, < 13 = complacency.
-    """
     bull_points = 0
     bear_points = 0
     metrics     = []
 
-    # VIX
     if vix is not None:
         if vix > 22:
             bear_points += 2
@@ -1324,7 +1346,6 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             vix_sig = ("😌 Normal Volatility", "bull")
         metrics.append(("India VIX", f"{vix:.2f}", vix_sig[0], vix_sig[1]))
 
-    # RSI
     if rsi:
         if rsi > 70:
             bear_points += 1
@@ -1334,7 +1355,6 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             rsi_sig = ("📈 Bullish Momentum", "bull")
         elif rsi > 45:
             rsi_sig = ("➡️ Neutral Momentum", "neutral")
-            pass
         elif rsi > 30:
             bear_points += 1
             rsi_sig = ("📉 Weak / Bearish Momentum", "warn")
@@ -1343,7 +1363,6 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             rsi_sig = ("📉 Oversold (Bearish Momentum)", "bear")
         metrics.append(("Technical RSI", f"{rsi:.0f}", rsi_sig[0], rsi_sig[1]))
 
-    # ADX
     adx_val_ = indicators.get("adx")       if indicators else None
     adx_dir_ = indicators.get("adx_dir",   "") if indicators else ""
     adx_lbl_ = indicators.get("adx_label", "") if indicators else ""
@@ -1363,7 +1382,6 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             adx_sig_ = ("↔️ Weak / Choppy — range-bound, scalp carefully", "warn")
         metrics.append(("ADX (Trend Strength)", f"{adx_val_:.1f}", adx_sig_[0], adx_sig_[1]))
 
-    # Intraday change
     if change_pct is not None:
         if change_pct > 0.5:
             bull_points += 1
@@ -1373,10 +1391,8 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             chg_sig = ("📉 Negative Day", "bear")
         else:
             chg_sig = ("➡️ Flat Day", "neutral")
-        # Show both % and pts in the outlook table
         metrics.append(("Intraday Move", f"{change_pct:+.2f}%", chg_sig[0], chg_sig[1]))
 
-    # Signal score from technical indicators
     if signal_score is not None:
         if signal_score >= 3:
             bull_points += 2
@@ -1388,7 +1404,6 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
             sig_lbl = ("🟡 Mixed Signal", "warn")
         metrics.append(("MTF Signal", f"{signal_score:+d}/6", sig_lbl[0], sig_lbl[1]))
 
-    # Overall verdict
     total = bull_points + bear_points
     if total == 0:
         sentiment = "SIDEWAYS"
@@ -1423,32 +1438,9 @@ def compute_market_outlook(vix, rsi, signal_score, change_pct):
 
 
 # ==============================================================
-# 16b. OPTION PREMIUM S/R  (computed every rerun from index S/R)
-#      Scales index support/resistance to option premium levels
-#      using delta. Works immediately — no candle data needed.
-#      Falls back to simple ±% bands when no candle data yet.
+# 16b. OPTION PREMIUM S/R
 # ==============================================================
-# ==============================================================
-# OPTION S/R — computed directly from option premium
-#
-# Three sources merged per option:
-#   1. Round premium levels  (e.g. 180, 185, 190 for CE at 186)
-#   2. IV-based daily move bands  (±1 sigma intraday range)
-#   3. Pivot levels from option OHLC if candle data available
-# This is completely independent of the index price.
-# ==============================================================
-
 def option_snr(ltp, iv_pct, dte_days, candle_df_arg=None):
-    """
-    Compute support and resistance directly for an option premium.
-
-    ltp        : current option LTP (Rs.)
-    iv_pct     : implied volatility as integer percent (e.g. 15)
-    dte_days   : days to expiry
-    candle_df_arg: index candle df for pivot extraction (optional)
-
-    Returns {"support": [...], "resistance": [...]}
-    """
     if not ltp or ltp <= 0:
         return {"support": [], "resistance": []}
 
@@ -1457,8 +1449,6 @@ def option_snr(ltp, iv_pct, dte_days, candle_df_arg=None):
     iv = iv_pct / 100.0 if iv_pct else 0.15
 
     # ── 1. Round number levels ──────────────────────────────
-    # Options traders watch round numbers (50, 100, 150, 200...)
-    # Choose step based on premium magnitude
     if ltp >= 500:   step = 50
     elif ltp >= 200: step = 25
     elif ltp >= 100: step = 10
@@ -1473,8 +1463,6 @@ def option_snr(ltp, iv_pct, dte_days, candle_df_arg=None):
         if r > ltp:      levels_res.append(r)
 
     # ── 2. IV-based intraday move bands ────────────────────
-    # Daily 1-sigma move of the option premium ≈ ltp * iv / sqrt(252)
-    # Intraday (half-day) ≈ divide by sqrt(2)
     import math
     daily_sigma = ltp * iv / math.sqrt(252)
     intra_sigma = daily_sigma / math.sqrt(2)
@@ -1485,32 +1473,27 @@ def option_snr(ltp, iv_pct, dte_days, candle_df_arg=None):
         if 0 < s < ltp:  levels_sup.append(s)
         if r > ltp:      levels_res.append(r)
 
-    # ── 3. Index candle pivots scaled by delta (if available) ──
+    # ── 3. Index candle pivots scaled by delta ──
     if candle_df_arg is not None and len(candle_df_arg) >= 6:
         highs  = candle_df_arg["high"].values
         lows   = candle_df_arg["low"].values
         closes = candle_df_arg["close"].values
-        vols   = candle_df_arg["volume"].values if "volume" in candle_df_arg.columns else None
 
         idx_cur = closes[-1]
-        # Rough delta estimate: option_ltp / spot (simplified)
         rough_delta = min(max(ltp / (idx_cur * 0.05), 0.1), 0.9)
 
         for i in range(2, len(candle_df_arg) - 2):
-            # Swing high → resistance
             if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
                 idx_dist = highs[i] - idx_cur
                 opt_lvl  = round(ltp + idx_dist * rough_delta, 1)
                 if opt_lvl > ltp * 1.005:
                     levels_res.append(opt_lvl)
-            # Swing low → support
             if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
                 idx_dist = lows[i] - idx_cur
                 opt_lvl  = round(ltp + idx_dist * rough_delta, 1)
                 if 0 < opt_lvl < ltp * 0.995:
                     levels_sup.append(opt_lvl)
 
-    # ── Deduplicate and sort ─────────────────────────────────
     def clean(lst, above):
         lst = [x for x in lst if x > 0]
         lst = sorted(set(round(x, 1) for x in lst),
@@ -1538,9 +1521,6 @@ pe_snr = {"support": [], "resistance": [], "current": pe_ltp or 0}
 if ce_ltp and ce_ltp > 0:
     ce_snr = option_snr(ce_ltp, iv_pct, dte_days, candle_df)
 elif spot and ce_strike:
-    # Estimate ATM option price via BS when chain not yet loaded
-    _ce_est = bs_greeks(spot, ce_strike, dte, r, iv, "call")
-    # Rough premium estimate: intrinsic + time value
     _ce_ltp_est = max(round(spot * iv * (dte_days / 365) ** 0.5 * 0.4, 1), 5.0)
     ce_snr = option_snr(_ce_ltp_est, iv_pct, dte_days, candle_df)
 
@@ -1551,7 +1531,7 @@ elif spot and pe_strike:
     pe_snr = option_snr(_pe_ltp_est, iv_pct, dte_days, candle_df)
 
 
-# Compute OI momentum using current and previous chain
+# Compute OI momentum
 _prev_chain  = st.session_state.prev_chain or {}
 _prev_prices = st.session_state.last_prices
 _prev_spot   = _prev_prices.get(conf["response_key"], {}).get("close") if _prev_prices else None
@@ -1560,7 +1540,6 @@ _oi_momentum = compute_oi_momentum(chain, _prev_chain, spot, _prev_spot)
 # ==============================================================
 # 17. GENERATE SIGNAL
 # ==============================================================
-# Incorporate OI momentum into signal score
 _oi_score_bonus = 0
 if _oi_momentum:
     if _oi_momentum["decision"] == "BUY CE":
@@ -1583,18 +1562,13 @@ signal = generate_signal(
 
 # ==============================================================
 # TRADE SAVE LOGIC
-# Saves the best option when a strong signal fires.
-# Holds it for the selected candle_interval in minutes.
-# Auto-expires after the interval, marks as completed.
 # ==============================================================
 _interval_mins = int(candle_interval)
 _now           = datetime.now()
 
-# Check if active trade has expired
 if st.session_state.active_trade and st.session_state.trade_saved_at:
     _elapsed = (_now - st.session_state.trade_saved_at).total_seconds() / 60
     if _elapsed >= _interval_mins:
-        # Move to trade log with exit info
         _trade = dict(st.session_state.active_trade)
         _trade["exit_time"]  = _now.strftime("%H:%M:%S")
         _trade["exit_price"] = (ce_ltp if _trade["type"] == "CE" else pe_ltp) or _trade["entry_premium"]
@@ -1608,10 +1582,8 @@ if st.session_state.active_trade and st.session_state.trade_saved_at:
         st.session_state.trade_log.insert(0, _trade)
         st.session_state.active_trade  = None
         st.session_state.trade_saved_at = None
-        # Keep last 20 trades only
         st.session_state.trade_log = st.session_state.trade_log[:20]
 
-# Auto-save new trade when signal is strong and no active trade
 if (signal and spot and atm
         and signal["direction"] in ("CE", "PE")
         and signal["confidence"] in ("High", "Medium")
@@ -1646,11 +1618,9 @@ if (signal and spot and atm
         st.session_state.trade_saved_at = _now
 
 # ==============================================================
-# ==============================================================
 # 18. PAGE HEADER + MARKET OUTLOOK
 # ==============================================================
 
-# Compute outlook
 _signal_score = signal["score"] if signal else None
 _outlook = compute_market_outlook(
     vix         = st.session_state.last_vix,
@@ -1662,7 +1632,6 @@ _outlook = compute_market_outlook(
 sent = _outlook["sentiment"]
 col  = _outlook["color"]
 
-# ADX badge
 _adx_val  = indicators.get("adx")       if indicators else None
 _adx_lbl  = indicators.get("adx_label") if indicators else None
 _adx_dir  = indicators.get("adx_dir")   if indicators else None
@@ -1692,15 +1661,9 @@ if _adx_val is not None:
 else:
     adx_badge = ''
 
-# ── Main header layout: 3 columns ──────────────────────────
-# Col 1: Index title + Live status (small)
-# Col 2: Spot Price (large, prominent)
-# Col 3: Market Sentiment badge + ADX
-# ──────────────────────────────────────────────────────────
 hc1, hc2, hc3 = st.columns([2, 2, 3])
 
 with hc1:
-    # Index name + feed status
     _status_icon = "🟢" if (run_live and spot) else ("🟡" if run_live else "⚪")
     _status_txt  = "Live" if (run_live and spot) else ("Connecting..." if run_live else "Paused")
     st.markdown(
@@ -1717,14 +1680,12 @@ with hc1:
     )
 
 with hc2:
-    # Spot price — most prominent element
     if spot:
         _close_px = feed_entry.get("close", spot) if feed_entry else spot
         _pts_diff = feed_entry.get("pts_diff") if feed_entry else None
         _chg_str, _chg_col = fmt_change(spot, _close_px, change_pct, st.session_state.show_points, _pts_diff)
         _age_str  = (f"{'< 1s' if data_age < 1 else f'{data_age:.0f}s'} ago"
                      if data_age is not None else "")
-        _mode_lbl = "pts" if st.session_state.show_points else "%"
         st.markdown(
             f'<div style="padding-top:2px;">'
             f'<div style="font-size:11px;color:#888;text-transform:uppercase;'
@@ -1749,7 +1710,6 @@ with hc2:
         )
 
 with hc3:
-    # Sentiment badge + ADX + VIX
     vix_val = st.session_state.last_vix
     vix_str = f"VIX: {vix_val:.2f}%" if vix_val else ""
     st.markdown(
@@ -1773,7 +1733,6 @@ st.divider()
 with st.expander("📊 Market Outlook Summary", expanded=True):
     oc1, oc2 = st.columns([2, 1])
     with oc1:
-        # Metric table
         color_map = {
             "bull":    ("#00c853", "#0d3320"),
             "bear":    ("#f44336", "#3d0a0a"),
@@ -1805,7 +1764,6 @@ with st.expander("📊 Market Outlook Summary", expanded=True):
         st.markdown(table_html, unsafe_allow_html=True)
 
     with oc2:
-        # Overall verdict card
         bull = _outlook["bull_points"]
         bear = _outlook["bear_points"]
         total_pts = bull + bear or 1
@@ -1836,7 +1794,6 @@ st.divider()
 # ACTIVE TRADE CARD + TRADE LOG
 # ==============================================================
 
-# ── Active trade sticky card ─────────────────────────────────
 _at = st.session_state.active_trade
 if _at:
     _elapsed_mins = round(
@@ -1852,11 +1809,50 @@ if _at:
     _type_bg      = "#0d3320" if _at["type"] == "CE" else "#3d0a0a"
 
     st.markdown(
-        f'<div style="background:{_type_bg};border:2px solid {_type_col};'        f'border-radius:12px;padding:16px 20px;margin-bottom:12px;">'        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'        f'<div>'        f'<span style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">🔴 Active Trade</span>'        f'<div style="font-size:22px;font-weight:700;color:{_type_col};margin-top:2px;">'        f'{_at["index"]} {_at["strike"]:,} {_at["type"]} &nbsp;'        f'<span style="font-size:13px;background:{_type_bg};border:1px solid {_type_col};'        f'padding:2px 8px;border-radius:4px;">{_at["confidence"]}</span>'        f'</div></div>'        f'<div style="text-align:right;">'        f'<div style="font-size:11px;color:#aaa;">Entry: {_at["entry_time"]} &nbsp;|&nbsp; Expires: {_at["expiry_at"]}</div>'        f'<div style="font-size:11px;color:#aaa;margin-top:2px;">{_at["interval_mins"]}m interval &nbsp;|&nbsp; {_at["lots"]} lot</div>'        f'</div></div>'        f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px;">'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Entry Premium</div>'        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_at["entry_premium"]:.1f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Current Premium</div>'        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_cur_premium:.1f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Unrealised P&L</div>'        f'<div style="font-size:16px;font-weight:600;color:{_pnl_col};">'        f'{"+" if _cur_pnl >= 0 else ""}Rs.{_cur_pnl:.0f}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Target Spot</div>'        f'<div style="font-size:16px;font-weight:600;color:#00c853;">{_at["target_spot"] or "--"}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">Stop-Loss</div>'        f'<div style="font-size:16px;font-weight:600;color:#f44336;">{_at["sl_spot"] or "--"}</div></div>'        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'        f'<div style="font-size:10px;color:#aaa;">OI Scenario</div>'        f'<div style="font-size:13px;font-weight:600;color:white;">{_at["scenario"]}</div></div>'        f'</div>'        f'<div style="display:flex;align-items:center;gap:10px;">'        f'<span style="font-size:11px;color:#aaa;">Time elapsed:</span>'        f'<span style="font-family:monospace;color:{_type_col};">{_progress_bar}</span>'        f'<span style="font-size:11px;color:#aaa;">{_elapsed_mins:.1f}m / {_at["interval_mins"]}m'        f'&nbsp; ({_remaining:.1f}m remaining)</span>'        f'</div></div>',
+        f'<div style="background:{_type_bg};border:2px solid {_type_col};'
+        f'border-radius:12px;padding:16px 20px;margin-bottom:12px;">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">'
+        f'<div>'
+        f'<span style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">🔴 Active Trade</span>'
+        f'<div style="font-size:22px;font-weight:700;color:{_type_col};margin-top:2px;">'
+        f'{_at["index"]} {_at["strike"]:,} {_at["type"]} &nbsp;'
+        f'<span style="font-size:13px;background:{_type_bg};border:1px solid {_type_col};'
+        f'padding:2px 8px;border-radius:4px;">{_at["confidence"]}</span>'
+        f'</div></div>'
+        f'<div style="text-align:right;">'
+        f'<div style="font-size:11px;color:#aaa;">Entry: {_at["entry_time"]} &nbsp;|&nbsp; Expires: {_at["expiry_at"]}</div>'
+        f'<div style="font-size:11px;color:#aaa;margin-top:2px;">{_at["interval_mins"]}m interval &nbsp;|&nbsp; {_at["lots"]} lot</div>'
+        f'</div></div>'
+        f'<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px;">'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">Entry Premium</div>'
+        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_at["entry_premium"]:.1f}</div></div>'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">Current Premium</div>'
+        f'<div style="font-size:16px;font-weight:600;color:white;">Rs.{_cur_premium:.1f}</div></div>'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">Unrealised P&L</div>'
+        f'<div style="font-size:16px;font-weight:600;color:{_pnl_col};">'
+        f'{"+" if _cur_pnl >= 0 else ""}Rs.{_cur_pnl:.0f}</div></div>'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">Target Spot</div>'
+        f'<div style="font-size:16px;font-weight:600;color:#00c853;">{_at["target_spot"] or "--"}</div></div>'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">Stop-Loss</div>'
+        f'<div style="font-size:16px;font-weight:600;color:#f44336;">{_at["sl_spot"] or "--"}</div></div>'
+        f'<div style="background:rgba(255,255,255,0.05);border-radius:6px;padding:8px 10px;">'
+        f'<div style="font-size:10px;color:#aaa;">OI Scenario</div>'
+        f'<div style="font-size:13px;font-weight:600;color:white;">{_at["scenario"]}</div></div>'
+        f'</div>'
+        f'<div style="display:flex;align-items:center;gap:10px;">'
+        f'<span style="font-size:11px;color:#aaa;">Time elapsed:</span>'
+        f'<span style="font-family:monospace;color:{_type_col};">{_progress_bar}</span>'
+        f'<span style="font-size:11px;color:#aaa;">{_elapsed_mins:.1f}m / {_at["interval_mins"]}m'
+        f'&nbsp; ({_remaining:.1f}m remaining)</span>'
+        f'</div></div>',
         unsafe_allow_html=True
     )
 
-    # Manual exit button
     col_exit, col_void = st.columns([1, 4])
     with col_exit:
         if st.button("🚪 Exit Trade Now", type="primary"):
@@ -1901,7 +1897,6 @@ if st.session_state.trade_log:
             df_log.style.map(color_pnl, subset=["P&L"]),
             width="stretch", hide_index=True
         )
-        # Summary
         total_pnl = sum(t.get("pnl", 0) for t in st.session_state.trade_log)
         wins      = sum(1 for t in st.session_state.trade_log if t.get("pnl", 0) > 0)
         losses    = sum(1 for t in st.session_state.trade_log if t.get("pnl", 0) < 0)
@@ -1918,7 +1913,7 @@ if st.session_state.trade_log:
     st.divider()
 
 # ==============================================================
-# 19. BEST TO BUY NOW  (prominent recommendation card)
+# 19. BEST TO BUY NOW
 # ==============================================================
 if signal and spot and atm:
     direction = signal["direction"]
@@ -1926,7 +1921,6 @@ if signal and spot and atm:
     conf_str  = signal["confidence"]
     score     = signal["score"]
 
-    # Pick the recommended option details
     if direction == "CE":
         rec_strike  = ce_strike
         rec_ltp     = ce_ltp
@@ -1956,28 +1950,23 @@ if signal and spot and atm:
         label_col  = "#ffd740"
         opt_type   = "WAIT"
 
-    # Confidence bar (filled dots)
     conf_dots = {"High": "●●●●●", "Medium": "●●●○○", "Low": "●●○○○"}
     dots      = conf_dots.get(conf_str, "●○○○○")
 
-    # Score bar
     max_score  = 6
     score_pct  = min(abs(score) / max_score * 100, 100)
     score_fill = int(score_pct / 10)
     score_bar  = "█" * score_fill + "░" * (10 - score_fill)
 
-    # Window badge
     window_badge = (
         '<span style="background:#ff6d00;color:white;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;">🔥 HOT WINDOW</span>'
         if _high_vol else
         '<span style="background:#37474f;color:#ccc;padding:2px 8px;border-radius:4px;font-size:12px;">❄️ CALM WINDOW</span>'
     )
 
-    # Target / SL
     tgt = f"{signal['target']:,.0f}" if signal["target"] else "--"
     sl  = f"{signal['stop_loss']:,.0f}" if signal["stop_loss"] else "--"
 
-    # Reason pills
     icons = {"bull": "🟢", "bear": "🔴", "warn": "🟡", "info": "🔵"}
     reason_html = "".join(
         f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0;font-size:13px;">'
@@ -1994,7 +1983,6 @@ if signal and spot and atm:
     padding:20px 24px;
     margin-bottom:16px;
 ">
-    <!-- Header row -->
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
         <div>
             <div style="font-size:13px;color:#aaa;font-weight:500;letter-spacing:0.08em;text-transform:uppercase;">
@@ -2021,7 +2009,6 @@ if signal and spot and atm:
         </div>
     </div>
 
-    <!-- Key numbers row -->
     <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px;">
         <div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px;">
             <div style="font-size:11px;color:#aaa;text-transform:uppercase;">Premium</div>
@@ -2053,7 +2040,6 @@ if signal and spot and atm:
         </div>
     </div>
 
-    <!-- Greeks mini row -->
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px;">
         <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:8px 10px;font-size:13px;">
             <span style="color:#888;">Delta</span>
@@ -2069,7 +2055,6 @@ if signal and spot and atm:
         </div>
     </div>
 
-    <!-- Signal reasons -->
     <div style="border-top:1px solid rgba(255,255,255,0.1);padding-top:12px;">
         <div style="font-size:11px;color:#888;text-transform:uppercase;margin-bottom:6px;">
             Why this signal
@@ -2079,7 +2064,6 @@ if signal and spot and atm:
 </div>
 """
     else:
-        # WAIT / AVOID card
         card_html = f"""
 <div style="
     background:{bg_color};
@@ -2122,7 +2106,7 @@ elif run_live and not indicators:
     st.divider()
 
 # ==============================================================
-# OI MOMENTUM DECISION MATRIX  (below signal, above CE/PE panels)
+# OI MOMENTUM DECISION MATRIX
 # ==============================================================
 if _oi_momentum and run_live:
     with st.expander("📊 OI Momentum Decision Matrix", expanded=True):
@@ -2132,7 +2116,24 @@ if _oi_momentum and run_live:
         oi_arrow    = "↑" if oi["oi_rising"]    else "↓"
 
         st.markdown(
-            f'<div style="background:{oi["decision_bg"]};border:2px solid {oi["decision_col"]};'            f'border-radius:10px;padding:14px 18px;margin-bottom:12px;">'            f'<div style="display:flex;align-items:center;justify-content:space-between;">'            f'<div>'            f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">OI Momentum Signal</div>'            f'<div style="font-size:22px;font-weight:700;color:{oi["decision_col"]};margin-top:4px;">'            f'{oi["emoji"]} {oi["decision"]}</div>'            f'<div style="font-size:13px;color:#ccc;margin-top:4px;">'            f'Scenario: <b>{oi["scenario"]}</b> &nbsp;|&nbsp; '            f'Price {price_arrow} + OI {oi_arrow} &nbsp;|&nbsp; '            f'Strength: <b style="color:{oi["decision_col"]};">{oi["strength"]}</b>'            f'</div></div>'            f'<div style="text-align:right;font-size:13px;color:#aaa;">'            f'CE OI: <b style="color:#00c853;">{oi["ce_oi_now"]:,}</b><br>'            f'PE OI: <b style="color:#f44336;">{oi["pe_oi_now"]:,}</b><br>'            f'PCR: <b style="color:white;">{oi["pcr"] or "--"}</b>'            f'{"↑" if oi["pcr_rising"] else ("↓" if oi["pcr_rising"] is False else "")}'            f'</div></div></div>',
+            f'<div style="background:{oi["decision_bg"]};border:2px solid {oi["decision_col"]};'
+            f'border-radius:10px;padding:14px 18px;margin-bottom:12px;">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between;">'
+            f'<div>'
+            f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;letter-spacing:0.08em;">OI Momentum Signal</div>'
+            f'<div style="font-size:22px;font-weight:700;color:{oi["decision_col"]};margin-top:4px;">'
+            f'{oi["emoji"]} {oi["decision"]}</div>'
+            f'<div style="font-size:13px;color:#ccc;margin-top:4px;">'
+            f'Scenario: <b>{oi["scenario"]}</b> &nbsp;|&nbsp; '
+            f'Price {price_arrow} + OI {oi_arrow} &nbsp;|&nbsp; '
+            f'Strength: <b style="color:{oi["decision_col"]};">{oi["strength"]}</b>'
+            f'</div></div>'
+            f'<div style="text-align:right;font-size:13px;color:#aaa;">'
+            f'CE OI: <b style="color:#00c853;">{oi["ce_oi_now"]:,}</b><br>'
+            f'PE OI: <b style="color:#f44336;">{oi["pe_oi_now"]:,}</b><br>'
+            f'PCR: <b style="color:white;">{oi["pcr"] or "--"}</b>'
+            f'{"↑" if oi["pcr_rising"] else ("↓" if oi["pcr_rising"] is False else "")}'
+            f'</div></div></div>',
             unsafe_allow_html=True
         )
 
@@ -2145,12 +2146,25 @@ if _oi_momentum and run_live:
                 ("↑ Rising",  "↓ Decreasing", "Short Covering", "Caution — Exit PE","#ffc107", "#2a2200"),
                 ("↓ Falling", "↓ Decreasing", "Long Unwinding", "Caution — Exit CE","#ffc107", "#2a2200"),
             ]
-            tbl = ('<table style="width:100%;border-collapse:collapse;font-size:13px;">'                   '<thead><tr>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Price</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">OI</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Interpretation</th>'                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Recommendation</th>'                   '</tr></thead><tbody>')
+            tbl = ('<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                   '<thead><tr>'
+                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Price</th>'
+                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">OI</th>'
+                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Interpretation</th>'
+                   '<th style="padding:6px 10px;color:#888;border-bottom:1px solid #333;text-align:left;">Recommendation</th>'
+                   '</tr></thead><tbody>')
             for price_act, oi_mom, interp, rec_txt, fg, bg in matrix_rows:
                 is_cur  = oi["scenario"].replace(" ", "").lower() in interp.replace(" ", "").lower()
                 row_bg  = f"background:{bg};" if is_cur else ""
                 border  = f"border-left:3px solid {fg};" if is_cur else "border-left:3px solid transparent;"
-                tbl += (f'<tr style="{row_bg}{border}">'                        f'<td style="padding:7px 10px;color:#ccc;">{price_act}</td>'                        f'<td style="padding:7px 10px;color:#ccc;">{oi_mom}</td>'                        f'<td style="padding:7px 10px;color:#ccc;">{interp}</td>'                        f'<td style="padding:7px 10px;">'                        f'<span style="background:{bg};color:{fg};padding:2px 8px;'                        f'border-radius:4px;font-weight:600;font-size:12px;">{rec_txt}</span>'                        f'</td></tr>')
+                tbl += (f'<tr style="{row_bg}{border}">'
+                        f'<td style="padding:7px 10px;color:#ccc;">{price_act}</td>'
+                        f'<td style="padding:7px 10px;color:#ccc;">{oi_mom}</td>'
+                        f'<td style="padding:7px 10px;color:#ccc;">{interp}</td>'
+                        f'<td style="padding:7px 10px;">'
+                        f'<span style="background:{bg};color:{fg};padding:2px 8px;'
+                        f'border-radius:4px;font-weight:600;font-size:12px;">{rec_txt}</span>'
+                        f'</td></tr>')
             tbl += "</tbody></table>"
             st.markdown(tbl, unsafe_allow_html=True)
 
@@ -2160,39 +2174,53 @@ if _oi_momentum and run_live:
                 dist_r = round(oi["resistance_wall"] - (spot or 0), 0)
                 sign_r = f"+{dist_r:.0f}" if dist_r >= 0 else f"{dist_r:.0f}"
                 st.markdown(
-                    f'<div style="background:#3d0a0a;border:1px solid #f44336;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#f44336;text-transform:uppercase;">🔴 Resistance Wall</div>'                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["resistance_wall"]:,}'                    f'<span style="font-size:12px;color:#f44336;margin-left:8px;">({sign_r} pts)</span></div>'                    f'<div style="font-size:12px;color:#aaa;">CE OI: {oi["max_ce_oi"]:,}</div></div>',
+                    f'<div style="background:#3d0a0a;border:1px solid #f44336;border-radius:6px;'
+                    f'padding:10px 14px;margin-bottom:8px;">'
+                    f'<div style="font-size:11px;color:#f44336;text-transform:uppercase;">🔴 Resistance Wall</div>'
+                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["resistance_wall"]:,}'
+                    f'<span style="font-size:12px;color:#f44336;margin-left:8px;">({sign_r} pts)</span></div>'
+                    f'<div style="font-size:12px;color:#aaa;">CE OI: {oi["max_ce_oi"]:,}</div></div>',
                     unsafe_allow_html=True)
             if oi["support_wall"] and oi["max_pe_oi"] > 0:
                 dist_s = round(oi["support_wall"] - (spot or 0), 0)
                 sign_s = f"+{dist_s:.0f}" if dist_s >= 0 else f"{dist_s:.0f}"
                 st.markdown(
-                    f'<div style="background:#0d3320;border:1px solid #00c853;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#00c853;text-transform:uppercase;">🟢 Support Wall</div>'                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["support_wall"]:,}'                    f'<span style="font-size:12px;color:#00c853;margin-left:8px;">({sign_s} pts)</span></div>'                    f'<div style="font-size:12px;color:#aaa;">PE OI: {oi["max_pe_oi"]:,}</div></div>',
+                    f'<div style="background:#0d3320;border:1px solid #00c853;border-radius:6px;'
+                    f'padding:10px 14px;margin-bottom:8px;">'
+                    f'<div style="font-size:11px;color:#00c853;text-transform:uppercase;">🟢 Support Wall</div>'
+                    f'<div style="font-size:20px;font-weight:700;color:white;">{oi["support_wall"]:,}'
+                    f'<span style="font-size:12px;color:#00c853;margin-left:8px;">({sign_s} pts)</span></div>'
+                    f'<div style="font-size:12px;color:#aaa;">PE OI: {oi["max_pe_oi"]:,}</div></div>',
                     unsafe_allow_html=True)
             if oi["pcr"]:
                 pcr_col   = "#00c853" if oi["pcr"] > 1.0 else ("#f44336" if oi["pcr"] < 0.8 else "#ffc107")
                 pcr_trend = "↑ Rising (Bullish)" if oi["pcr_rising"] else ("↓ Falling (Bearish)" if oi["pcr_rising"] is False else "Stable")
                 st.markdown(
-                    f'<div style="background:#1a1a2e;border:1px solid #444;border-radius:6px;'                    f'padding:10px 14px;margin-bottom:8px;">'                    f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;">PCR</div>'                    f'<div style="font-size:20px;font-weight:700;color:{pcr_col};">{oi["pcr"]}</div>'                    f'<div style="font-size:12px;color:#aaa;">{pcr_trend}</div></div>',
+                    f'<div style="background:#1a1a2e;border:1px solid #444;border-radius:6px;'
+                    f'padding:10px 14px;margin-bottom:8px;">'
+                    f'<div style="font-size:11px;color:#aaa;text-transform:uppercase;">PCR</div>'
+                    f'<div style="font-size:20px;font-weight:700;color:{pcr_col};">{oi["pcr"]}</div>'
+                    f'<div style="font-size:12px;color:#aaa;">{pcr_trend}</div></div>',
                     unsafe_allow_html=True)
             if oi["liquid_strikes"]:
                 st.markdown(
-                    f'<div style="font-size:12px;color:#aaa;padding:8px;">'                    f'<b>Liquid strikes:</b> {", ".join(str(s) for s in sorted(oi["liquid_strikes"]))}'                    f'</div>', unsafe_allow_html=True)
+                    f'<div style="font-size:12px;color:#aaa;padding:8px;">'
+                    f'<b>Liquid strikes:</b> {", ".join(str(s) for s in sorted(oi["liquid_strikes"]))}'
+                    f'</div>', unsafe_allow_html=True)
 
     st.divider()
 
 # ==============================================================
-# 20. RECOMMENDED CE / PE PANELS  (directly below signal card)
+# 20. RECOMMENDED CE / PE PANELS
 # ==============================================================
 
 def build_snr_html(snr, ltp, label_col, tf_label):
-    """Build S/R pills HTML string. Always returns something visible."""
     if not ltp or ltp <= 0:
         return ""
 
     supports    = list(snr.get("support", []))
     resistances = list(snr.get("resistance", []))
 
-    # Guaranteed fallback — always show levels
     if not supports:
         supports = [round(ltp * 0.97, 1), round(ltp * 0.94, 1), round(ltp * 0.91, 1)]
     if not resistances:
@@ -2275,7 +2303,6 @@ if spot and atm:
 
     st.divider()
 
-    # Net summary
     st.markdown("### Net Position Summary")
     net_delta = round(g_ce["delta"] + g_pe["delta"], 4)
     net_theta = round(g_ce["theta"] + g_pe["theta"], 2)
@@ -2289,14 +2316,11 @@ if spot and atm:
 
     st.divider()
 
-# ==============================================================
-
 
 # ==============================================================
 # 23. MULTI-TIMEFRAME INDICATOR PANEL
 # ==============================================================
 def _ind_row(label, ind, tf, candles_n=None):
-    """Render one timeframe indicator row."""
     if not ind:
         st.caption(f"{tf} — waiting for data")
         return
@@ -2322,7 +2346,6 @@ def _ind_row(label, ind, tf, candles_n=None):
 if indicators or ind_15 or ind_30:
     st.markdown("### Technical Indicators — Multi-Timeframe")
 
-    # Confluence score across timeframes
     def _tf_score(ind):
         if not ind: return 0
         s = 0
@@ -2365,7 +2388,6 @@ if indicators or ind_15 or ind_30:
     st.divider()
 
 
-
 # ==============================================================
 # 23b. SUPPORT & RESISTANCE PANEL
 # ==============================================================
@@ -2376,14 +2398,12 @@ if candle_df is not None and spot and len(candle_df) >= 6:
         resistances = idx_snr.get("resistance", [])
         current_px  = idx_snr.get("current", spot)
 
-        # Build visual level map
         all_levels = (
             [{"price": p, "type": "R", "color": "#f44336", "bg": "#3d0a0a"} for p in sorted(resistances, reverse=True)] +
             [{"price": current_px, "type": "NOW", "color": "#ffffff", "bg": "#1a1a3e"}] +
             [{"price": p, "type": "S", "color": "#00c853", "bg": "#0d3320"} for p in sorted(supports, reverse=True)]
         )
 
-        # Left column: visual price ladder
         lc, rc = st.columns([1, 1])
         with lc:
             st.markdown("**Price Ladder**")
@@ -2396,7 +2416,9 @@ if candle_df is not None and spot and len(candle_df) >= 6:
                 sign = f"+{dist}" if dist > 0 else str(dist)
                 width = "100%" if t == "NOW" else "80%"
                 border = "2px solid #fff" if t == "NOW" else f"1px solid {col}"
-                label  = f"🔴 R  {p:,.1f}  ({sign})" if t == "R" else                          f"⚪ NOW  {p:,.1f}" if t == "NOW" else                          f"🟢 S  {p:,.1f}  ({sign})"
+                label  = (f"🔴 R  {p:,.1f}  ({sign})" if t == "R" else
+                          f"⚪ NOW  {p:,.1f}" if t == "NOW" else
+                          f"🟢 S  {p:,.1f}  ({sign})")
                 st.markdown(
                     f'<div style="background:{bg};border:{border};border-radius:6px;'
                     f'padding:6px 12px;margin:3px 0;width:{width};font-size:13px;'
@@ -2420,7 +2442,6 @@ if candle_df is not None and spot and len(candle_df) >= 6:
                 mid_pt    = round((min(resistances) + max(supports)) / 2, 1)
                 st.metric("Trading Range",      f"{range_pts} pts", f"Mid: {mid_pt:,.1f}")
 
-            # Position within range
             if supports and resistances:
                 s_price = max(supports)
                 r_price = min(resistances)
@@ -2443,7 +2464,6 @@ if candle_df is not None and spot and len(candle_df) >= 6:
 
         st.divider()
 
-        # Option premium S/R table
         if ce_ltp or pe_ltp:
             st.markdown("**Option Premium S/R Levels**")
             op1, op2 = st.columns(2)
@@ -2548,19 +2568,16 @@ if not run_live:
     st.info("Toggle **Start Live Feed** in the sidebar to begin.")
 
 # ==============================================================
-# 26. AUTO-REFRESH  (market hours only, seamless via st.fragment)
+# 26. AUTO-REFRESH
 # ==============================================================
 if run_live:
     if _refresh is not None:
-        # Market is open — seamless auto-refresh using st.rerun(scope="fragment")
-        # Falls back to full rerun if fragment scope not supported (older Streamlit)
         time.sleep(_refresh / 1000)
         try:
             st.rerun(scope="fragment")
         except TypeError:
             st.rerun()
     else:
-        # Market is closed — show status, no refresh loop
         now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         wd      = now_ist.weekday()
         t       = now_ist.hour * 60 + now_ist.minute
